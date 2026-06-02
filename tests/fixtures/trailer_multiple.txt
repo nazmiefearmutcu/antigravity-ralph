@@ -1,0 +1,20 @@
+First I drafted a handoff, then I corrected myself and emitted a better one at
+the very end. The extractor must take the LAST fence (TRAILER_STATUS=multiple),
+because agents self-correct at the end (§3.4.2 step 4).
+
+<<<RALPH_HANDOFF
+{ "what_changed": "FIRST (wrong) draft — should be ignored.",
+  "files": ["wrong.py"], "tier": "T6_dx",
+  "metrics_after": { "tests_pass": 1, "coverage_pct": 1, "lint_errors": 9, "bench_p95_ms": 99 },
+  "next_candidate": "ignore me", "confidence": 0.1, "done_with_explicit_goals": false }
+RALPH_HANDOFF>>>
+
+On reflection I redo the handoff correctly:
+
+<<<RALPH_HANDOFF
+{ "what_changed": "SECOND (correct) draft — should win.",
+  "files": ["right.py"], "tier": "T2_coverage",
+  "metrics_after": { "tests_pass": 12, "coverage_pct": 60.0, "lint_errors": 0, "bench_p95_ms": 100 },
+  "next_candidate": "keep going", "i_did_NOT": "nothing", "confidence": 0.7,
+  "done_with_explicit_goals": false }
+RALPH_HANDOFF>>>

@@ -1,0 +1,18 @@
+Here is my handoff (I wrapped the JSON in a markdown ```json code fence inside
+the RALPH_HANDOFF fence — the salvage_json step must strip the ```json fences,
+§3.4.2 step 5):
+
+<<<RALPH_HANDOFF
+```json
+{
+  "what_changed": "Wrapped the JSON in a markdown code fence.",
+  "files": ["lib/validate_trailer.py"],
+  "tier": "T3_hardening",
+  "metrics_after": { "tests_pass": 20, "coverage_pct": 65.0, "lint_errors": 0, "bench_p95_ms": 150 },
+  "next_candidate": "stop wrapping in code fences",
+  "i_did_NOT": "emit clean JSON",
+  "confidence": 0.55,
+  "done_with_explicit_goals": false
+}
+```
+RALPH_HANDOFF>>>

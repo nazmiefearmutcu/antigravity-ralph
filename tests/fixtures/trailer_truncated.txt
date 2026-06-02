@@ -1,0 +1,12 @@
+My response was cut off mid-handoff (truncated output): the opening fence and an
+unbalanced/unterminated JSON object, with no closing RALPH_HANDOFF>>> fence.
+salvage_json must close the unbalanced braces (and the extractor may fall back to
+the last balanced object / synthesis), still exiting 0 with a coerced object
+(§3.4.2 step 5).
+
+<<<RALPH_HANDOFF
+{
+  "what_changed": "Response was truncated before the closing fence.",
+  "files": ["lib/extract_trailer.py"],
+  "tier": "T2_coverage",
+  "metrics_after": { "tests_pass": 60, "coverage_pct": 74.0

@@ -1,0 +1,6 @@
+Error: not authenticated. You are not logged in to Antigravity. Please sign in.
+invalid api key / unauthorized.
+
+(classify.bats: with a non-zero rc, auth/credential failure language must
+classify as `fatal_misconfig` — the loop waits loudly and retries, never exits,
+§7.4 / INV-5.)

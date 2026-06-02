@@ -1,0 +1,4 @@
+I made a change but completely forgot to emit a handoff trailer. There is no
+fence and no JSON object anywhere in this text at all, just prose describing the
+work. The extractor must reach ladder step 3 and SYNTHESIZE a trailer from
+harness facts, with TRAILER_STATUS=missing, still exiting 0.

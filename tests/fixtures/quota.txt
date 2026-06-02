@@ -1,0 +1,9 @@
+Error: request failed.
+
+You have hit your usage limit for this period. RESOURCE_EXHAUSTED: too many
+requests (429). Rate limit exceeded; your credits are exhausted. Please try
+again later.
+
+(Used by classify.bats T-CLASSIFY-*: a transcript containing quota/rate-limit
+language must classify as rate_limit — even when rc==0, the silent-zombie guard
+demotes the run, §7.4.)

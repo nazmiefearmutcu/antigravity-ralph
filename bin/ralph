@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+#
+# ralph — the user-facing CLI dispatcher for the Antigravity Ralph loop (SPEC §8).
+#
+# Role: thin bash dispatcher (SPEC §9.1, Surface 1) that scaffolds a target's runtime dir,
+# launches/monitors/stops the immortal supervisor (bin/ralph-supervisor.sh, §7), runs the
+# preflight doctor, renders the launchd daemon, and surfaces status/logs/metrics.
+#
+# Subcommands (SPEC §8 table, verbatim):
+#   init  start  once  status  tail  pause  resume  stop  doctor  install-daemon
+#   list  logs  metrics  version  help   + hidden __run-supervisor
+#
+# Exit codes (SPEC §8, shared by all surfaces):
+#   0 ok/alive · 1 dead/error · 2 paused · 3 already-running (lock held) · 4 misconfig (doctor FAIL)
+#
+# Bash compatibility (per build rules): macOS /bin/bash is 3.2 and lacks `declare -A`/namerefs.
+# This dispatcher itself needs NEITHER, so it runs under 3.2 fine. BUT lib/ratchet.sh DOES use
+# associative arrays + namerefs (the spec's §5.2 pseudocode), so the supervisor body needs bash>=4.
+# RESOLUTION (documented choice): before exec'ing the supervisor we locate a bash>=4 (Homebrew
+# /opt/homebrew/bin/bash or /usr/local/bin/bash) and run the supervisor under it; if none exists we
+# fall back to the current bash and warn (the ratchet still works if `local -n` is unavailable only
+# in that the integrator must vendor a bash>=4 — see TECH_GROUNDING). The dispatcher commands that do
+# not touch the ratchet (init/status/tail/pause/...) never need bash>=4.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# ── locate self + repo root (robust against symlink install) ──────────────────
+__ralph_resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) : ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+RALPH_BIN_DIR="$(__ralph_resolve_self)"
+RALPH_HOME="$(cd -P "$RALPH_BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+
+# Resolve where the lib/, prompts/, integrations/ live: repo when in-repo, else installed share dir.
+if [ -d "$RALPH_HOME/lib" ] && [ -f "$RALPH_HOME/bin/ralph-supervisor.sh" ]; then
+  RALPH_SHARE_DIR="$RALPH_HOME"
+elif [ -d "$HOME/.local/share/ralph" ]; then
+  RALPH_SHARE_DIR="$HOME/.local/share/ralph"
+else
+  RALPH_SHARE_DIR="$RALPH_HOME"
+fi
+RALPH_LIB_DIR="$RALPH_SHARE_DIR/lib"
+RALPH_PROMPTS_DIR="$RALPH_SHARE_DIR/prompts"
+RALPH_INTEGRATIONS_DIR="$RALPH_SHARE_DIR/integrations"
+SUPERVISOR="$RALPH_SHARE_DIR/bin/ralph-supervisor.sh"
+[ -f "$SUPERVISOR" ] || SUPERVISOR="$RALPH_BIN_DIR/ralph-supervisor.sh"
+export RALPH_LIB_DIR RALPH_HOME RALPH_SHARE_DIR
+
+DAEMON_DIR="$HOME/.ralph"
+TARGETS_TSV="$DAEMON_DIR/targets.tsv"
+
+# ── tiny helpers ──────────────────────────────────────────────────────────────
+now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'ralph: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Find a bash >= 4 for the supervisor (ratchet needs assoc arrays / namerefs). Echo path or empty.
+find_bash4() {
+  local cand
+  for cand in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    local major
+    major="$("$cand" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null)"
+    case "$major" in ''|*[!0-9]*) continue ;; esac
+    [ "$major" -ge 4 ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
+# Resolve a target argument → absolute path with a .ralph/ (or scaffoldable for init).
+# Accepts: a path, a registered name (from targets.tsv), or empty → $PWD.
+resolve_target() {
+  local arg="${1:-}"
+  if [ -z "$arg" ]; then
+    if [ -d "$PWD/.ralph" ]; then printf '%s\n' "$PWD"; return 0; fi
+    # Maybe $PWD is a registered target's path even without .ralph yet — fall through to error.
+    die "no target given and \$PWD has no .ralph/ (run: ralph init)"
+  fi
+  if [ -d "$arg" ]; then
+    ( cd "$arg" >/dev/null 2>&1 && pwd ); return 0
+  fi
+  # Registered name lookup.
+  if [ -f "$TARGETS_TSV" ]; then
+    local p
+    p="$(awk -F '\t' -v n="$arg" '$1==n{print $2; exit}' "$TARGETS_TSV" 2>/dev/null)"
+    if [ -n "$p" ] && [ -d "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  fi
+  die "target not found: $arg (not a path and not a registered name)"
+}
+
+require_initialized() {
+  [ -d "$1/.ralph" ] || die "$1 is not initialized (run: ralph init \"$1\")"
+}
+
+# jq read of a target's state/heartbeat with a default.
+jget() { jq -r "$2 // \"$3\"" "$1" 2>/dev/null || printf '%s' "$3"; }
+
+# ── doctor (SPEC §8 / §7 preflight) ───────────────────────────────────────────
+# Diagnose; print PASS/FAIL per check; exit 4 on ANY FAIL. `start` calls this first.
+cmd_doctor() {
+  local target; target="$(resolve_target "${1:-}")" || exit 4
+  local fails=0
+  _chk() { # _chk "name" 0|1 "detail"
+    if [ "$2" -eq 0 ]; then printf '  PASS  %-26s %s\n' "$1" "$3"
+    else printf '  FAIL  %-26s %s\n' "$1" "$3"; fails=$((fails+1)); fi
+  }
+  printf 'ralph doctor — %s\n' "$target"
+
+  if have agy; then _chk "agy on PATH" 0 "$(command -v agy)"; else _chk "agy on PATH" 1 "install Antigravity CLI"; fi
+  if have jq;  then _chk "jq present"  0 "$(command -v jq)";  else _chk "jq present"  1 "brew install jq"; fi
+  if [ -x /usr/bin/perl ]; then _chk "/usr/bin/perl present" 0 "$(/usr/bin/perl -e 'print $]')"; else _chk "/usr/bin/perl present" 1 "needed for bounded_run/sleep"; fi
+  if have python3; then _chk "python3 present" 0 "$(python3 --version 2>&1)"; else _chk "python3 present" 1 "needed for trailer/ratchet helpers"; fi
+
+  # bash>=4 is a PREFERENCE, not a requirement: every lib is bash-3.2-safe (no assoc arrays/namerefs),
+  # so the /bin/bash 3.2 fallback runs the supervisor correctly. Never fail the gate on this.
+  if find_bash4 >/dev/null 2>&1; then _chk "bash (>=4 preferred)" 0 "$(find_bash4)"; else _chk "bash (>=4 preferred)" 0 "/bin/bash 3.2 fallback (libs are 3.2-safe)"; fi
+
+  if pgrep -f 'language_server' >/dev/null 2>&1; then _chk "language_server up" 0 "Antigravity running"; else _chk "language_server up" 1 "open -ga Antigravity"; fi
+
+  if git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then _chk "target is git" 0 "$target"; else _chk "target is git" 1 "git init the target"; fi
+
+  # Disk space (warn-level FAIL if < 200MB free on the target's volume).
+  local freek; freek="$(df -k "$target" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -n "$freek" ] && [ "$freek" -gt 204800 ]; then _chk "disk space" 0 "$((freek/1024)) MB free"; else _chk "disk space" 1 "low/unknown free space"; fi
+
+  # Lock state.
+  if [ -d "$target/.ralph/ralph.lock" ]; then
+    local owner; owner="$(cat "$target/.ralph/ralph.lock/owner.pid" 2>/dev/null)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then _chk "lock state" 0 "held by live pid $owner (running)"
+    else _chk "lock state" 0 "stale lock (will be stolen)"; fi
+  else _chk "lock state" 0 "free"; fi
+
+  # config + RATCHET.json sanity (only if initialized).
+  if [ -d "$target/.ralph" ]; then
+    if [ -f "$target/.ralph/config.env" ]; then _chk "config.env present" 0 ""; else _chk "config.env present" 1 "ralph init"; fi
+    if [ -f "$target/.ralph/RATCHET.json" ] && jq . "$target/.ralph/RATCHET.json" >/dev/null 2>&1; then
+      _chk "RATCHET.json parses" 0 "$(jq -r '.metrics | keys | join(",")' "$target/.ralph/RATCHET.json" 2>/dev/null)"
+    else _chk "RATCHET.json parses" 1 "missing or invalid"; fi
+  else
+    _chk "initialized" 1 "no .ralph/ (run: ralph init)"
+  fi
+
+  # Real authentication probe: `agy -p PONG` (costs a trivial credit; SPEC §8 mandates it for doctor).
+  if have agy; then
+    local out rc
+    out="$(agy -p "Reply with exactly one word: PONG" --dangerously-skip-permissions 2>/dev/null)"; rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi 'PONG'; then _chk "agy authenticated (PONG)" 0 "round-trip ok"
+    else _chk "agy authenticated (PONG)" 1 "rc=$rc out='$(printf '%s' "$out" | head -c 60)'"; fi
+  fi
+
+  if [ "$fails" -gt 0 ]; then printf '\nDOCTOR: %d FAIL — refusing to start (use --force to override).\n' "$fails"; exit 4; fi
+  printf '\nDOCTOR: all checks PASS.\n'; exit 0
+}
+
+# ── init (SPEC §8 / §3.6 auto-detect / §2.2 scaffold) ─────────────────────────
+cmd_init() {
+  local path="" prompt_file="" gate="referee" mission_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt)  prompt_file="${2:-}"; shift 2 ;;
+      --gate)    gate="${2:-}"; shift 2 ;;
+      --mission) mission_file="${2:-}"; shift 2 ;;
+      --*)       die "init: unknown flag $1" ;;
+      *)         path="$1"; shift ;;
+    esac
+  done
+  [ -n "$path" ] || path="$PWD"
+  [ -d "$path" ] || die "init: no such directory: $path"
+  local target; target="$(cd "$path" >/dev/null 2>&1 && pwd)"
+  case "$gate" in none|tests|referee) : ;; *) die "init: --gate must be none|tests|referee" ;; esac
+
+  # R1: single runtime dir is .ralph/. If a scaffolded .ralph_self/ exists, rename it.
+  if [ -d "$target/.ralph_self" ] && [ ! -d "$target/.ralph" ]; then
+    mv "$target/.ralph_self" "$target/.ralph"
+    printf 'init: renamed .ralph_self/ → .ralph/\n'
+  fi
+  mkdir -p "$target/.ralph" \
+           "$target/.ralph/iter" "$target/.ralph/iterations" \
+           "$target/.ralph/metrics" "$target/.ralph/logs" \
+           "$target/.ralph/archive" "$target/.ralph/refs"
+
+  local name; name="$(basename "$target")"
+
+  # ── verify/metric auto-detection (SPEC §3.6); first hit wins ──
+  local verify_cmd="" verify_required=1 absent_policy="verify_only"
+  local pass_cmd="" cov_cmd="" lint_cmd="" lang=""
+  if [ -f "$target/pyproject.toml" ] || ls "$target"/*.py >/dev/null 2>&1 || [ -f "$target/setup.py" ] || [ -f "$target/pytest.ini" ] || [ -f "$target/tox.ini" ]; then
+    lang=python; verify_cmd="python3 -m pytest -q"
+    pass_cmd="AUTO:pytest_passcount"; cov_cmd="AUTO:coverage"; lint_cmd="AUTO:lint"
+  elif [ -f "$target/package.json" ]; then
+    lang=node; verify_cmd="npm test --silent"
+    pass_cmd="AUTO:jest_passcount"; lint_cmd="AUTO:lint"
+  elif [ -f "$target/Cargo.toml" ]; then
+    lang=rust; verify_cmd="cargo test --quiet"
+    pass_cmd="AUTO:cargo_passcount"; lint_cmd="AUTO:lint"
+  elif [ -f "$target/go.mod" ]; then
+    lang=go; verify_cmd="go test ./..."
+    pass_cmd="AUTO:go_passcount"
+  elif [ -f "$target/Makefile" ] && grep -Eq '^test:' "$target/Makefile" 2>/dev/null; then
+    lang=make; verify_cmd="make test"
+  else
+    # Nothing testable directly: cheap build/lint smoke as proxy verify; else tie_breaker.
+    if [ "$lang" = "" ] && { [ -f "$target/pyproject.toml" ] || ls "$target"/*.py >/dev/null 2>&1; }; then
+      verify_cmd="python3 -m compileall -q ."; verify_required=0
+    elif [ -f "$target/package.json" ]; then
+      verify_cmd="npm run build"; verify_required=0
+    elif [ -f "$target/Cargo.toml" ]; then
+      verify_cmd="cargo build"; verify_required=0
+    else
+      verify_cmd=""; verify_required=0; absent_policy="tie_breaker"
+    fi
+  fi
+
+  # ── RATCHET.json (SPEC §3.1, schema_version 4) ──
+  if [ ! -f "$target/.ralph/RATCHET.json" ]; then
+    local metrics_json
+    # Build a metrics object from whatever resolvers we detected; always include tests_pass.
+    metrics_json='{"tests_pass":{"dir":"up","floor":0,"frozen":false,"cmd":"'"${pass_cmd:-AUTO:pytest_passcount}"'","tolerance":0}'
+    if [ -n "$cov_cmd" ];  then metrics_json="$metrics_json"',"coverage_pct":{"dir":"up","floor":0.0,"frozen":false,"cmd":"'"$cov_cmd"'","tolerance":0.0}'; fi
+    if [ -n "$lint_cmd" ]; then metrics_json="$metrics_json"',"lint_errors":{"dir":"down","floor":999,"frozen":false,"cmd":"'"$lint_cmd"'","tolerance":0}'; fi
+    metrics_json="$metrics_json"'}'
+
+    local vcmd_for_json; if [ -n "$verify_cmd" ]; then vcmd_for_json="$verify_cmd"; else vcmd_for_json="AUTO"; fi
+    local tmp="$target/.ralph/RATCHET.json.tmp"
+    cat >"$tmp" <<JSON
+{
+  "schema_version": 4,
+  "repo_root": "$target",
+  "updated_at": "$(now)",
+  "policy": {
+    "accept_rule": "no metric crosses its floor in the wrong direction; >=1 non-frozen metric strictly improves",
+    "regression_tolerance": 0,
+    "absent_policy": "$absent_policy",
+    "on_reject": "git reset --hard <baseline>; record cause in LEDGER.REJECTED",
+    "floor_update": "tighten each floor to the achieved value ONLY after ADVANCE (the ratchet click)"
+  },
+  "metrics": $metrics_json,
+  "verify": {
+    "required": $( [ "$verify_required" = 1 ] && echo true || echo false ),
+    "cmd": "$vcmd_for_json",
+    "timeout_s": 900,
+    "flaky_reverify_runs": 2,
+    "supports_focus": false
+  },
+  "best": null,
+  "baseline": null,
+  "regression_pending": null,
+  "goals_done": false
+}
+JSON
+    if jq . "$tmp" >/dev/null 2>&1; then mv -f "$tmp" "$target/.ralph/RATCHET.json"; else rm -f "$tmp"; die "init: generated RATCHET.json failed to parse"; fi
+  fi
+
+  # ── canonical command surface (RCE guard, SPEC §12): the metric/verify commands the harness EXECUTES
+  #    via `sh -c` are read from here, NOT from the agent-writable .ralph/RATCHET.json. Seed it from the
+  #    operator's RATCHET.json so agent edits to RATCHET.json's `cmd` fields can never run code. ──
+  mkdir -p "$target/.ralph/.canonical" 2>/dev/null || true
+  if [ -f "$target/.ralph/RATCHET.json" ]; then
+    jq '{verify:(.verify.cmd // "true"),
+         metrics:(.metrics | to_entries | map({key:.key, value:(.value.cmd // "true")}) | from_entries)}' \
+      "$target/.ralph/RATCHET.json" > "$target/.ralph/.canonical/RATCHET.cmds.json" 2>/dev/null || true
+  fi
+
+  # ── config.env (SPEC §3.6) ──
+  if [ ! -f "$target/.ralph/config.env" ]; then
+    cat >"$target/.ralph/config.env" <<CONF
+# Ralph per-target config (SPEC §3.6). KEY=VALUE only; sourced by the supervisor.
+RALPH_TARGET_NAME=$name
+RALPH_MAX_ITERATIONS=0
+RALPH_MIN_INTERVAL_S=20
+RALPH_AGY_TIMEOUT_S=900
+RALPH_BACKOFF_BASE_S=30
+RALPH_BACKOFF_CAP_S=1800
+RALPH_BACKOFF_JITTER_PCT=25
+RALPH_CRASHLOOP_THRESHOLD=5
+RALPH_CRASHLOOP_WINDOW_S=300
+RALPH_CRASHLOOP_COOLDOWN_S=600
+RALPH_MAX_CONSECUTIVE_REVERTS=40
+RALPH_RELAUNCH_ANTIGRAVITY=1
+RALPH_SKIP_PERMISSIONS=1
+RALPH_SANDBOX=1
+RALPH_COMMIT_GATE=$gate
+RALPH_REFEREE_EVERY=10
+RALPH_PUSH=0
+RALPH_REVERT_STRATEGY=reset_hard
+RALPH_VERIFY_REQUIRED=$verify_required
+RALPH_PROMPT_FILE=${prompt_file:-prompts/iterate.tmpl}
+CONF
+  fi
+
+  # ── allow.txt (SPEC §12 command allowlist) ──
+  if [ ! -f "$target/.ralph/allow.txt" ]; then
+    cat >"$target/.ralph/allow.txt" <<'ALLOW'
+# Command allowlist injected into the iteration prompt (SPEC §12). One token/pattern per line.
+# The agent must refuse anything NOT covered here. Hard limits in the prompt still override.
+git
+python3
+pip
+pytest
+make
+npm
+node
+cargo
+go
+ruff
+mypy
+tsc
+jq
+ALLOW
+  fi
+
+  # ── MISSION.md seed (SPEC §3.2) ──
+  if [ ! -f "$target/.ralph/MISSION.md" ]; then
+    if [ -n "$mission_file" ] && [ -f "$mission_file" ]; then
+      cp "$mission_file" "$target/.ralph/MISSION.md"
+    else
+      cat >"$target/.ralph/MISSION.md" <<MISSION
+# MISSION
+## North Star
+$name is an excellent, well-tested, hardened codebase whose verify command is always green and
+whose ratcheted metrics only ever improve.
+
+## Success Criteria (explicit, checkable)
+- SC1: all tests pass — metric: tests_pass — target: monotonically non-decreasing, never 0
+- SC2: lint/type errors trend to zero — metric: lint_errors — target: 0
+
+<!-- When ALL SCs are met the loop does NOT stop; it shifts to the tier ladder (SPEC §9). -->
+
+## Hard Constraints (never violate)
+- HC1: never edit MISSION.md / RATCHET.json / state.json by hand
+- HC2: every change must keep the verify command green
+- HC3: focused diffs only; one unit of work per iteration
+
+## Ratcheted Metrics (mirrors RATCHET.json)
+- tests_pass (up)
+- lint_errors (down)
+
+## Out of Scope
+- Do not invent network-dependent "novel probes".
+- Do not rewrite the build system as a "probe".
+MISSION
+    fi
+  fi
+
+  # ── canonical (TOFU) copy of the read-only MISSION.md (SPEC §3.2, T-SAFE-2) ──
+  # Seeded here from the PRISTINE mission so restore_protected_files() can detect any later agent
+  # tampering even on the very first iteration (a lazy post-agy snapshot would canonicalize a tamper).
+  mkdir -p "$target/.ralph/.canonical" 2>/dev/null || true
+  [ -f "$target/.ralph/.canonical/MISSION.md" ] || \
+    cp "$target/.ralph/MISSION.md" "$target/.ralph/.canonical/MISSION.md" 2>/dev/null || true
+
+  # ── seed the work-memory files (append-only; created empty-but-valid) ──
+  [ -f "$target/.ralph/PROGRESS.md" ] || printf '# PROGRESS (append-only journal)\n' > "$target/.ralph/PROGRESS.md"
+  if [ ! -f "$target/.ralph/LEDGER.md" ]; then
+    cat >"$target/.ralph/LEDGER.md" <<'LEDGER'
+# LEDGER
+## DONE (do not redo — shipped & ratcheted)
+## REJECTED (tried, did NOT improve — do not repeat without NEW evidence)
+## OPEN (known work, ranked; agent picks the top viable one)
+- O-1 (T2) COVERAGE: raise test coverage of the least-covered module. evidence: initial seed.
+LEDGER
+  fi
+  [ -f "$target/.ralph/HANDOFF.md" ] || printf '# HANDOFF 0000 (seed)\nstate_after:\n  tier: T1_correctness\nnext_highest_leverage: "Run verify; fix any failing test, else pick top LEDGER.OPEN item."\n' > "$target/.ralph/HANDOFF.md"
+  [ -f "$target/.ralph/progress.ndjson" ] || : > "$target/.ralph/progress.ndjson"
+  [ -f "$target/.ralph/metrics/history.jsonl" ] || : > "$target/.ralph/metrics/history.jsonl"
+
+  # ── add .ralph/ + cache/ to the TARGET's .gitignore (TECH_GROUNDING agy cache/ gotcha) ──
+  local gi="$target/.gitignore"
+  touch "$gi"
+  grep -qxF '.ralph/' "$gi" 2>/dev/null || printf '.ralph/\n' >> "$gi"
+  grep -qxF 'cache/'  "$gi" 2>/dev/null || printf 'cache/\n'  >> "$gi"
+
+  # ── register in ~/.ralph/targets.tsv ──
+  mkdir -p "$DAEMON_DIR"
+  touch "$TARGETS_TSV"
+  if ! awk -F '\t' -v n="$name" '$1==n{found=1} END{exit !found}' "$TARGETS_TSV" 2>/dev/null; then
+    printf '%s\t%s\t%s\n' "$name" "$target" "$(now)" >> "$TARGETS_TSV"
+  fi
+
+  printf '\ninit: scaffolded %s/.ralph/\n' "$target"
+  printf '  target name : %s\n' "$name"
+  printf '  verify cmd  : %s\n' "${verify_cmd:-<none — proxy/tie_breaker>}"
+  printf '  verify req  : %s\n' "$verify_required"
+  printf '  commit gate : %s\n' "$gate"
+  printf '  metrics     : %s\n' "$(jq -r '.metrics | keys | join(", ")' "$target/.ralph/RATCHET.json" 2>/dev/null)"
+  printf '\nNext: ralph doctor "%s"  then  ralph start "%s"\n' "$target" "$target"
+}
+
+# ── start (SPEC §8) — doctor first, then launch supervisor ────────────────────
+cmd_start() {
+  local foreground="auto" daemon=0 force=0
+  local maxiter="" interval="" timeout="" nosandbox=0 push=0
+  local target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --foreground) foreground=1; daemon=0; shift ;;
+      --daemon)     daemon=1; foreground=0; shift ;;
+      --max-iterations) maxiter="${2:-}"; shift 2 ;;
+      --interval)   interval="${2:-}"; shift 2 ;;
+      --timeout)    timeout="${2:-}"; shift 2 ;;
+      --no-sandbox) nosandbox=1; shift ;;
+      --push)       push=1; shift ;;
+      --force)      force=1; shift ;;
+      --*)          die "start: unknown flag $1" ;;
+      *)            target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+
+  # An explicit `ralph start` is an unambiguous "run now" → clear any prior stop markers (plain or
+  # --permanent) so a previously-stopped target restarts cleanly.
+  rm -f "$target/.ralph/STOP" "$target/.ralph/STOP_PERMANENT" 2>/dev/null || true
+
+  # Already running? (lock held by a live pid) → exit 3.
+  if [ -d "$target/.ralph/ralph.lock" ]; then
+    local owner; owner="$(cat "$target/.ralph/ralph.lock/owner.pid" 2>/dev/null)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      printf 'ralph: already running for %s (pid %s)\n' "$target" "$owner" >&2; exit 3
+    fi
+  fi
+
+  # Preflight: run doctor; refuse on FAIL unless --force (SPEC §8).
+  if [ "$force" != 1 ]; then
+    if ! ( cmd_doctor "$target" ); then
+      printf 'ralph: doctor FAILED for %s — refusing to start (use --force to override).\n' "$target" >&2
+      exit 4
+    fi
+  else
+    warn "--force: skipping doctor gate (you accept the risk)"
+  fi
+
+  # Compose per-run flag overrides. These MUST beat config.env, so they travel via the dedicated
+  # RALPH_OVERRIDE channel (a newline-separated KEY=VALUE list the supervisor applies AFTER sourcing
+  # config.env). A plain env var would be clobbered by `. config.env`; RALPH_OVERRIDE is not.
+  local overrides=""
+  _add_override() { overrides="${overrides}$1
+"; }
+  [ -n "$maxiter" ]  && _add_override "RALPH_MAX_ITERATIONS=$maxiter"
+  [ -n "$interval" ] && _add_override "RALPH_MIN_INTERVAL_S=$interval"
+  [ -n "$timeout" ]  && _add_override "RALPH_AGY_TIMEOUT_S=$timeout"
+  [ "$nosandbox" = 1 ] && { warn "--no-sandbox is NOT recommended"; _add_override "RALPH_SANDBOX=0"; }
+  [ "$push" = 1 ]      && { warn "--push enabled (guarded: owned-remote only, never force-push)"; _add_override "RALPH_PUSH=1"; }
+  local env_pairs=()
+  [ -n "$overrides" ] && env_pairs+=("RALPH_OVERRIDE=$overrides")
+
+  # Pick a bash>=4 for the ratchet body (documented compatibility resolution).
+  local bash4; bash4="$(find_bash4 2>/dev/null || true)"
+  local runner="${bash4:-bash}"
+  [ -n "$bash4" ] || warn "no bash>=4 found; running supervisor under '$runner' (ratchet may degrade — see TECH_GROUNDING)"
+
+  # Decide foreground vs daemon. Default: foreground if attached to a TTY, else daemon.
+  if [ "$foreground" = "auto" ]; then
+    if [ -t 1 ]; then foreground=1; else daemon=1; fi
+  fi
+
+  # Under bash 3.2 + set -u, expanding an empty array fails ("unbound variable").
+  # Build the env-prefix argv safely: only expand when non-empty.
+  if [ "$daemon" = 1 ]; then
+    mkdir -p "$target/.ralph/logs"
+    # nohup + disown so it survives terminal close (SPEC §8).
+    if [ "${#env_pairs[@]}" -gt 0 ]; then
+      nohup env "${env_pairs[@]}" "$runner" "$SUPERVISOR" "$target" \
+          >> "$target/.ralph/logs/supervisor.log" 2>&1 &
+    else
+      nohup "$runner" "$SUPERVISOR" "$target" \
+          >> "$target/.ralph/logs/supervisor.log" 2>&1 &
+    fi
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    # Give it a moment to write its pid file.
+    local i=0
+    while [ "$i" -lt 20 ]; do
+      [ -f "$target/.ralph/ralph.pid" ] && break
+      /usr/bin/perl -e 'select(undef,undef,undef,0.25)' 2>/dev/null || true
+      i=$((i+1))
+    done
+    local livepid; livepid="$(cat "$target/.ralph/ralph.pid" 2>/dev/null || printf '%s' "$pid")"
+    printf 'ralph: started (daemon) target=%s pid=%s\n' "$target" "$livepid"
+    printf '  log: %s/.ralph/logs/supervisor.log\n' "$target"
+    exit 0
+  else
+    printf 'ralph: starting (foreground) target=%s — Ctrl-C to drain.\n' "$target"
+    if [ "${#env_pairs[@]}" -gt 0 ]; then
+      exec env "${env_pairs[@]}" "$runner" "$SUPERVISOR" "$target"
+    else
+      exec "$runner" "$SUPERVISOR" "$target"
+    fi
+  fi
+}
+
+# ── once (SPEC §8) — exactly one iteration, no loop ───────────────────────────
+cmd_once() {
+  local target; target="$(resolve_target "${1:-}")" || exit 1
+  require_initialized "$target"
+  local bash4; bash4="$(find_bash4 2>/dev/null || true)"
+  local runner="${bash4:-bash}"
+  # RALPH_ONCE=1 makes the supervisor drain after EXACTLY ONE resolved unit (gate ran, or the unit
+  # timed out) — regardless of the absolute iteration counter or config.env's RALPH_MAX_ITERATIONS.
+  # (RALPH_ONCE is a per-run control flag, not a config.env knob, so a plain env var is authoritative.)
+  env RALPH_ONCE=1 "$runner" "$SUPERVISOR" "$target"
+  local rc=$?
+  # Surface the decision + deltas + trailer status from the last iteration record.
+  local lastdir
+  lastdir="$(ls -1d "$target"/.ralph/iter/*/ 2>/dev/null | tail -1)"
+  if [ -n "$lastdir" ]; then
+    printf '\n--- once result (%s) ---\n' "$target"
+    if [ -f "$lastdir/decision.json" ]; then
+      printf 'DECISION : %s\n' "$(jq -r '.decision // "?"' "$lastdir/decision.json" 2>/dev/null)"
+      printf 'CAUSE    : %s\n' "$(jq -r '.cause // ""' "$lastdir/decision.json" 2>/dev/null)"
+    fi
+    if [ -f "$lastdir/trailer.json" ]; then
+      printf 'TRAILER  : %s\n' "$(jq -c '.' "$lastdir/trailer.json" 2>/dev/null | head -c 200)"
+    fi
+  fi
+  exit "$rc"
+}
+
+# ── status (SPEC §8) — exit 0 alive, 1 dead, 2 paused ─────────────────────────
+cmd_status() {
+  local json=0 watch=0 target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)  json=1; shift ;;
+      --watch) watch=1; shift ;;
+      --*)     die "status: unknown flag $1" ;;
+      *)       target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+
+  _status_once() {
+    local hb="$target/.ralph/heartbeat.json" st="$target/.ralph/state.json"
+    local pid; pid="$(cat "$target/.ralph/ralph.pid" 2>/dev/null)"
+    local alive=0
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=1
+    local paused=0; [ -f "$target/.ralph/PAUSE" ] && paused=1
+    local stopping=0; [ -f "$target/.ralph/STOP" ] && stopping=1
+
+    local iter phase last_class cfail crev nexteta uptime stalled hbts hbepoch
+    iter="$(jget "$st" '.iteration' '?')"
+    phase="$(jget "$hb" '.phase' 'unknown')"
+    last_class="$(jget "$st" '.last_class' 'none')"
+    cfail="$(jget "$st" '.consecutive_failures' '0')"
+    crev="$(jget "$st" '.consecutive_reverts' '0')"
+    nexteta="$(jget "$hb" '.next_action_eta_s' '0')"
+    uptime="$(jget "$hb" '.uptime_s' '0')"
+    stalled="$(jget "$hb" '.stalled' 'false')"
+    hbts="$(jget "$hb" '.ts' '')"
+    hbepoch="$(jget "$hb" '.epoch' '0')"
+
+    # Liveness-by-heartbeat-age, even if the pid file is stale.
+    local statusword="dead" code=1
+    if [ "$stopping" = 1 ] && [ "$alive" = 0 ]; then statusword="stopped"; code=1
+    elif [ "$paused" = 1 ] && [ "$alive" = 1 ]; then statusword="paused"; code=2
+    elif [ "$alive" = 1 ]; then statusword="alive"; code=0
+    else
+      # Maybe alive but pid file missing: trust a fresh heartbeat.
+      if [ "$hbepoch" -gt 0 ] 2>/dev/null; then
+        local nowe; nowe="$(date -u +%s)"
+        local age=$((nowe - hbepoch))
+        local minint; minint="$(jget "$st" '.backoff_s' '20')"; [ "$minint" -gt 0 ] 2>/dev/null || minint=20
+        if [ "$age" -lt $((3 * (minint > 20 ? minint : 20))) ]; then statusword="alive"; code=0; fi
+      fi
+    fi
+
+    if [ "$json" = 1 ]; then
+      printf '{"target":"%s","status":"%s","alive":%s,"paused":%s,"stopping":%s,"iteration":"%s","phase":"%s","last_class":"%s","consecutive_failures":%s,"consecutive_reverts":%s,"next_action_eta_s":%s,"uptime_s":%s,"stalled":%s,"pid":"%s","heartbeat_ts":"%s"}\n' \
+        "$target" "$statusword" "$([ "$alive" = 1 ] && echo true || echo false)" \
+        "$([ "$paused" = 1 ] && echo true || echo false)" "$([ "$stopping" = 1 ] && echo true || echo false)" \
+        "$iter" "$phase" "$last_class" "${cfail:-0}" "${crev:-0}" "${nexteta:-0}" "${uptime:-0}" \
+        "$stalled" "${pid:-}" "$hbts"
+    else
+      printf 'ralph status — %s\n' "$target"
+      printf '  status            : %s\n' "$statusword"
+      printf '  pid               : %s\n' "${pid:-<none>}"
+      printf '  iteration         : %s\n' "$iter"
+      printf '  phase             : %s\n' "$phase"
+      printf '  last_class        : %s\n' "$last_class"
+      printf '  consec failures   : %s\n' "${cfail:-0}"
+      printf '  consec reverts    : %s\n' "${crev:-0}"
+      printf '  next action ETA   : %ss\n' "${nexteta:-0}"
+      printf '  uptime            : %ss\n' "${uptime:-0}"
+      printf '  stalled           : %s\n' "$stalled"
+      printf '  heartbeat         : %s\n' "${hbts:-<none>}"
+    fi
+    return "$code"
+  }
+
+  if [ "$watch" = 1 ]; then
+    while true; do
+      clear 2>/dev/null || true
+      _status_once || true
+      /usr/bin/perl -e 'select(undef,undef,undef,2)' 2>/dev/null || true
+    done
+  else
+    _status_once
+    exit $?
+  fi
+}
+
+# ── tail (SPEC §8) ─────────────────────────────────────────────────────────────
+cmd_tail() {
+  local iter="" target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --iter) iter="${2:-}"; shift 2 ;;
+      --*)    die "tail: unknown flag $1" ;;
+      *)      target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+  if [ -n "$iter" ]; then
+    local f; f="$target/.ralph/logs/iter-$(printf '%06d' "$iter").log"
+    [ -f "$f" ] || f="$target/.ralph/iter/$(printf '%06d' "$iter")/agy.stdout"
+    [ -f "$f" ] || die "tail: no log for iter $iter"
+    exec tail -f "$f"
+  fi
+  local sup="$target/.ralph/logs/supervisor.log"
+  [ -f "$sup" ] || die "tail: no supervisor.log yet (is it started?)"
+  exec tail -f "$sup"
+}
+
+# ── pause / resume (SPEC §8) ───────────────────────────────────────────────────
+cmd_pause() {
+  local target; target="$(resolve_target "${1:-}")" || exit 1
+  require_initialized "$target"
+  touch "$target/.ralph/PAUSE"
+  printf 'ralph: paused %s (idles, keeps heartbeating). resume with: ralph resume\n' "$target"
+  exit 2
+}
+cmd_resume() {
+  local target; target="$(resolve_target "${1:-}")" || exit 1
+  require_initialized "$target"
+  rm -f "$target/.ralph/PAUSE"
+  printf 'ralph: resumed %s\n' "$target"
+  exit 0
+}
+
+# ── stop (SPEC §8 / §9.1) ──────────────────────────────────────────────────────
+cmd_stop() {
+  local hard=0 permanent=0 target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hard)      hard=1; shift ;;
+      --permanent) permanent=1; shift ;;
+      --*)         die "stop: unknown flag $1" ;;
+      *)           target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+
+  # STOP sentinel is the single authority that disambiguates "user wants out" from "process died".
+  # --permanent additionally drops a STOP_PERMANENT marker so a relaunch/reboot stays down and the
+  # supervisor boots itself out of launchd (a plain stop leaves the plist enabled → reboot resumes).
+  [ "$permanent" = 1 ] && touch "$target/.ralph/STOP_PERMANENT"
+  touch "$target/.ralph/STOP"
+  local pid; pid="$(cat "$target/.ralph/ralph.pid" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    printf 'ralph: STOP sentinel set + SIGTERM → pid %s; draining...\n' "$pid"
+    # Wait up to 30s for a clean drain.
+    local i=0
+    while [ "$i" -lt 30 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      /usr/bin/perl -e 'select(undef,undef,undef,1)' 2>/dev/null || true
+      i=$((i+1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      if [ "$hard" = 1 ]; then
+        kill -KILL "$pid" 2>/dev/null || true
+        printf 'ralph: --hard → SIGKILL pid %s\n' "$pid"
+      else
+        warn "supervisor pid $pid still alive after 30s (use --hard to force)"
+      fi
+    else
+      printf 'ralph: drained cleanly.\n'
+    fi
+  else
+    printf 'ralph: no live supervisor; STOP sentinel set (a relaunch will drain immediately).\n'
+  fi
+
+  if [ "$permanent" = 1 ]; then
+    local name; name="$(basename "$target")"
+    local label="com.ralph.$name"
+    if have launchctl; then
+      launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+      printf 'ralph: --permanent → launchctl bootout %s (reboot will NOT resume)\n' "$label"
+    fi
+  fi
+  # Clean up our STOP sentinel only if the loop has fully drained; otherwise leave it for the relaunch.
+  exit 0
+}
+
+# ── install-daemon (SPEC §8 / §9.1) ───────────────────────────────────────────
+cmd_install_daemon() {
+  local uninstall=0 target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --uninstall) uninstall=1; shift ;;
+      --*)         die "install-daemon: unknown flag $1" ;;
+      *)           target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+  local name; name="$(basename "$target")"
+  local label="com.ralph.$name"
+  local plist_dst="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$DAEMON_DIR" "$HOME/Library/LaunchAgents"
+
+  if [ "$uninstall" = 1 ]; then
+    if have launchctl; then launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true; fi
+    rm -f "$plist_dst" "$DAEMON_DIR/$label.plist"
+    printf 'ralph: uninstalled daemon %s\n' "$label"
+    exit 0
+  fi
+
+  # Resolve the installed ralph path for ProgramArguments (prefer ~/.local/bin/ralph if it points here).
+  local ralph_path="$HOME/.local/bin/ralph"
+  [ -e "$ralph_path" ] || ralph_path="$RALPH_BIN_DIR/ralph"
+
+  # Render the template if present; else generate inline (faithful to §9.1).
+  local tmpl="$RALPH_INTEGRATIONS_DIR/launchd/com.ralph.TEMPLATE.plist"
+  if [ -f "$tmpl" ]; then
+    # Substitute {{NAME}} / {{TARGET_ABS}} (and {{RALPH_BIN}} if the template uses it).
+    # Pass values via ENV so no shell metacharacter ever lands in the perl source; do a LITERAL
+    # (\Q...\E on the ENV value, not on shell-interpolated text) replacement.
+    RALPH_TPL_NAME="$name" RALPH_TPL_TARGET="$target" RALPH_TPL_BIN="$ralph_path" \
+    RALPH_TPL_LOG="$DAEMON_DIR/daemon.log" \
+    RALPH_TPL_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+      /usr/bin/perl -pe '
+        s/\{\{NAME\}\}/$ENV{RALPH_TPL_NAME}/g;
+        s/\{\{TARGET_ABS\}\}/$ENV{RALPH_TPL_TARGET}/g;
+        s/\{\{RALPH_BIN\}\}/$ENV{RALPH_TPL_BIN}/g;
+        s/\{\{DAEMON_LOG\}\}/$ENV{RALPH_TPL_LOG}/g;
+        s/\{\{PATH_ENV\}\}/$ENV{RALPH_TPL_PATH}/g;
+      ' "$tmpl" > "$plist_dst"
+  else
+    cat >"$plist_dst" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+    <array>
+      <string>$ralph_path</string>
+      <string>__run-supervisor</string>
+      <string>$target</string>
+    </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$DAEMON_DIR/daemon.log</string>
+  <key>StandardErrorPath</key><string>$DAEMON_DIR/daemon.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict></plist>
+PLIST
+  fi
+  cp -f "$plist_dst" "$DAEMON_DIR/$label.plist"
+
+  if have launchctl; then
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/$(id -u)" "$plist_dst" >/dev/null 2>&1; then
+      launchctl enable "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+      launchctl kickstart -k "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+      printf 'ralph: installed + bootstrapped %s (RunAtLoad + KeepAlive)\n' "$label"
+    else
+      warn "launchctl bootstrap failed; plist written to $plist_dst — load it manually."
+    fi
+  else
+    warn "launchctl not found; plist written to $plist_dst"
+  fi
+  printf '  plist: %s\n' "$plist_dst"
+  exit 0
+}
+
+# ── list (SPEC §8) ──────────────────────────────────────────────────────────────
+cmd_list() {
+  [ -f "$TARGETS_TSV" ] || { printf 'no registered targets (run: ralph init)\n'; exit 0; }
+  printf '%-22s %-8s %s\n' "NAME" "STATE" "PATH"
+  while IFS=$'\t' read -r name path added; do
+    [ -n "$name" ] || continue
+    local state="dead"
+    if [ -d "$path/.ralph" ]; then
+      local pid; pid="$(cat "$path/.ralph/ralph.pid" 2>/dev/null)"
+      if [ -f "$path/.ralph/PAUSE" ]; then state="paused"
+      elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state="alive"
+      else state="dead"; fi
+    else
+      state="missing"
+    fi
+    printf '%-22s %-8s %s\n' "$name" "$state" "$path"
+  done < "$TARGETS_TSV"
+  exit 0
+}
+
+# ── logs (SPEC §8) ────────────────────────────────────────────────────────────
+cmd_logs() {
+  local archive=0 target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --archive) archive=1; shift ;;
+      --*)       die "logs: unknown flag $1" ;;
+      *)         target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+  if [ "$archive" = 1 ]; then
+    printf 'archived logs (%s/.ralph/archive):\n' "$target"
+    ls -1t "$target"/.ralph/archive/*.gz 2>/dev/null || printf '  <none>\n'
+  else
+    printf 'supervisor log : %s/.ralph/logs/supervisor.log\n' "$target"
+    printf 'iter logs dir  : %s/.ralph/iter/\n' "$target"
+    printf 'daemon log     : %s/daemon.log\n' "$DAEMON_DIR"
+  fi
+  exit 0
+}
+
+# ── metrics (SPEC §8) ──────────────────────────────────────────────────────────
+cmd_metrics() {
+  local json=0 target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --*)    die "metrics: unknown flag $1" ;;
+      *)      target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+  local r="$target/.ralph/RATCHET.json"
+  [ -f "$r" ] || die "metrics: no RATCHET.json"
+  if [ "$json" = 1 ]; then
+    jq '{metrics, best, baseline, goals_done}' "$r" 2>/dev/null || cat "$r"
+  else
+    printf 'ralph metrics — %s\n' "$target"
+    printf '\nFLOORS (metric | dir | floor | frozen):\n'
+    jq -r '.metrics | to_entries[] | "  \(.key) | \(.value.dir) | \(.value.floor) | \(.value.frozen)"' "$r" 2>/dev/null
+    printf '\nBEST:\n'
+    jq -r 'if .best == null then "  <none yet>" else "  commit=\(.best.commit) iter=\(.best.iteration) metrics=\(.best.metrics)" end' "$r" 2>/dev/null
+    printf '\nLAST MEASURED (history tail):\n'
+    tail -1 "$target/.ralph/metrics/history.jsonl" 2>/dev/null | sed 's/^/  /' || printf '  <none>\n'
+  fi
+  exit 0
+}
+
+# ── version / help ────────────────────────────────────────────────────────────
+cmd_version() { printf 'ralph %s (Antigravity Ralph loop)\n' "$VERSION"; exit 0; }
+cmd_help() {
+  cat <<'HELP'
+ralph — never-stopping, always-improving Antigravity agent loop (SPEC §8)
+
+USAGE
+  ralph <command> [target] [flags]
+
+  target = a path or a registered name; defaults to $PWD if it has .ralph/.
+
+COMMANDS
+  init [path] [--prompt F] [--gate none|tests|referee] [--mission F]
+                     Scaffold <target>/.ralph/ and register the target.
+  start [target] [--foreground|--daemon] [--max-iterations N] [--interval S]
+                 [--timeout S] [--no-sandbox] [--push] [--force]
+                     Run doctor, then launch the supervisor (default: fg w/ TTY, else daemon).
+  once [target]      Run EXACTLY ONE iteration (incl. gate); print DECISION + trailer.
+  status [target] [--json] [--watch]
+                     alive/dead/paused, iter, phase, class, failures/reverts, ETA, stalled.
+                     exit 0=alive, 1=dead, 2=paused.
+  tail [target] [--iter N]   tail -f the supervisor log (or one iteration).
+  pause [target]     touch .ralph/PAUSE (idles, keeps heartbeating). exit 2.
+  resume [target]    rm .ralph/PAUSE.
+  stop [target] [--hard] [--permanent]
+                     touch STOP + SIGTERM to drain; --hard SIGKILLs after 30s;
+                     --permanent also boots the launchd agent (no reboot resume).
+  doctor [target]    Preflight incl. a real `agy -p PONG`. exit 4 on any FAIL.
+  install-daemon [target] [--uninstall]   Render + bootstrap the launchd plist (§9).
+  list               All registered targets with live/dead/paused.
+  logs [target] [--archive]   Print log paths / list rotated archives.
+  metrics [target] [--json]   Current floors + best + last measured.
+  version | help
+
+EXIT CODES: 0 ok/alive · 1 dead/error · 2 paused · 3 already-running · 4 misconfig.
+
+KILL SWITCH: `touch <target>/.ralph/STOP` halts within ~20s, even mid-backoff.
+HELP
+  exit 0
+}
+
+# ── hidden: __run-supervisor (launchd ProgramArguments entry, SPEC §8) ────────
+cmd_run_supervisor() {
+  local target="${1:-}"
+  [ -n "$target" ] || die "__run-supervisor: target required"
+  [ -d "$target/.ralph" ] || die "__run-supervisor: $target not initialized"
+  local bash4; bash4="$(find_bash4 2>/dev/null || true)"
+  local runner="${bash4:-bash}"
+  exec "$runner" "$SUPERVISOR" "$target"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    init)            cmd_init "$@" ;;
+    start)           cmd_start "$@" ;;
+    once)            cmd_once "$@" ;;
+    status)          cmd_status "$@" ;;
+    tail)            cmd_tail "$@" ;;
+    pause)           cmd_pause "$@" ;;
+    resume)          cmd_resume "$@" ;;
+    stop)            cmd_stop "$@" ;;
+    doctor)          cmd_doctor "$@" ;;
+    install-daemon)  cmd_install_daemon "$@" ;;
+    list)            cmd_list "$@" ;;
+    logs)            cmd_logs "$@" ;;
+    metrics)         cmd_metrics "$@" ;;
+    version|--version|-V) cmd_version ;;
+    help|--help|-h)  cmd_help ;;
+    __run-supervisor) cmd_run_supervisor "$@" ;;
+    *) printf 'ralph: unknown command: %s (try: ralph help)\n' "$sub" >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

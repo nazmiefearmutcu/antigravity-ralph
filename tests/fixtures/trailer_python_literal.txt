@@ -1,0 +1,15 @@
+My handoff uses Python literals True / False / None instead of JSON
+true / false / null. salvage_json must rewrite them (§3.4.2 step 5).
+
+<<<RALPH_HANDOFF
+{
+  "what_changed": "JSON with Python literals True/False/None.",
+  "files": ["lib/validate_trailer.py"],
+  "tier": "T3_hardening",
+  "metrics_after": { "tests_pass": 50, "coverage_pct": 73.0, "lint_errors": None, "bench_p95_ms": 170 },
+  "next_candidate": "use json literals",
+  "i_did_NOT": "convert to JSON",
+  "confidence": 0.5,
+  "done_with_explicit_goals": False
+}
+RALPH_HANDOFF>>>

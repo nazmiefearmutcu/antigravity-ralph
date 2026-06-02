@@ -1,0 +1,16 @@
+I refactored the retry import, which introduced a circular import. I believe it
+is fine, but the harness's independent verify will catch the breakage and REVERT
+(T-RATCHET-3 / INV-1).
+
+<<<RALPH_HANDOFF
+{
+  "what_changed": "Refactored split(); claims +6 tests but actually breaks the build.",
+  "files": ["ralph_change.txt"],
+  "tier": "T1_correctness",
+  "metrics_after": { "tests_pass": 155, "coverage_pct": 80.0, "lint_errors": 0, "bench_p95_ms": 200 },
+  "next_candidate": "fix the import cycle",
+  "i_did_NOT": "verify carefully",
+  "confidence": 0.6,
+  "done_with_explicit_goals": false
+}
+RALPH_HANDOFF>>>

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.ralph.TEMPLATE.plist — SPEC §9.1 (Surface 1, reboot-survival Layer 2).
+  Rendered by `ralph install-daemon` → ~/Library/LaunchAgents/com.ralph.<name>.plist.
+  Placeholders substituted at render time by `ralph install-daemon` (all via env → no shell metachar
+  ever reaches the renderer; values are inserted literally):
+    {{NAME}}        → the target's RALPH_TARGET_NAME (registry name; no spaces).
+    {{TARGET_ABS}}  → the target repo's ABSOLUTE path (the dir holding .ralph/).
+    {{RALPH_BIN}}   → absolute path to the installed `ralph` CLI (e.g. ~/.local/bin/ralph).
+    {{DAEMON_LOG}}  → absolute path to the daemon log sink (e.g. ~/.ralph/daemon.log).
+    {{PATH_ENV}}    → the PATH the daemon runs with (must include ralph + agy + homebrew).
+  No host-specific paths are baked in, so the rendered plist is correct for ANY installing user.
+
+  Bootstrap (modern launchctl API, done by `ralph install-daemon`):
+    launchctl bootstrap gui/$(id -u) <plist>
+    launchctl enable    gui/$(id -u)/com.ralph.{{NAME}}
+    launchctl kickstart -k gui/$(id -u)/com.ralph.{{NAME}}
+
+  Stop/restart model (SPEC §9.1, corrected): a clean `ralph stop` drains the supervisor and it exits
+  0; with KeepAlive SuccessfulExit=false launchd does NOT resurrect a successful exit, so the loop
+  stays down while the plist remains registered — a reboot (RunAtLoad) resumes it, and the supervisor
+  clears any stale STOP sentinel at startup so the resumed run actually proceeds. `ralph stop
+  --permanent` additionally `launchctl bootout`s the agent so even a reboot will not resume.
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ralph.{{NAME}}</string>
+  <key>ProgramArguments</key>
+    <array>
+      <string>{{RALPH_BIN}}</string>
+      <string>__run-supervisor</string>
+      <string>{{TARGET_ABS}}</string>
+    </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>{{DAEMON_LOG}}</string>
+  <key>StandardErrorPath</key><string>{{DAEMON_LOG}}</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>{{PATH_ENV}}</string>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict></plist>

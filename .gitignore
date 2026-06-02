@@ -1,0 +1,12 @@
+# Ralph runtime state lives inside each TARGET repo's .ralph/, never here,
+# but ignore any local self-run artifacts and OS noise.
+.ralph/
+.ralph_self/run/
+cache/
+*.log
+*.pid
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+node_modules/
