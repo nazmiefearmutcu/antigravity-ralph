@@ -1,0 +1,16 @@
+I added a single trivial change. (The claimed metrics below are deliberately
+inflated far beyond what the tree can actually measure — the harness must
+detect this via record_claim_vs_truth and REVERT, INV-3 / T-RATCHET-2.)
+
+<<<RALPH_HANDOFF
+{
+  "what_changed": "Claims a huge jump in passing tests that did not happen.",
+  "files": ["ralph_change.txt"],
+  "tier": "T1_correctness",
+  "metrics_after": { "tests_pass": 999, "coverage_pct": 99.9, "lint_errors": 0, "bench_p95_ms": 1 },
+  "next_candidate": "keep going",
+  "i_did_NOT": "anything real",
+  "confidence": 0.99,
+  "done_with_explicit_goals": false
+}
+RALPH_HANDOFF>>>

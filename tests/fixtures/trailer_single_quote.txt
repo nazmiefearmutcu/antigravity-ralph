@@ -1,0 +1,15 @@
+My handoff uses single quotes instead of double quotes. salvage_json must
+convert single→double quotes and re-parse (§3.4.2 step 5).
+
+<<<RALPH_HANDOFF
+{
+  'what_changed': 'JSON with single quotes.',
+  'files': ['lib/extract_trailer.py'],
+  'tier': 'T1_correctness',
+  'metrics_after': { 'tests_pass': 40, 'coverage_pct': 72.0, 'lint_errors': 0, 'bench_p95_ms': 175 },
+  'next_candidate': 'use double quotes',
+  'i_did_NOT': 'use valid JSON quoting',
+  'confidence': 0.5,
+  'done_with_explicit_goals': false
+}
+RALPH_HANDOFF>>>

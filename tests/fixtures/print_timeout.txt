@@ -1,0 +1,6 @@
+working...
+context deadline exceeded: print-timeout reached while waiting for the model to
+finish. deadline exceeded.
+
+(classify.bats: transcript with print-timeout / deadline-exceeded language must
+classify as `timeout` even on a non-124 rc, §7.4.)

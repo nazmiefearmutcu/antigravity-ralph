@@ -1,0 +1,12 @@
+I forgot the fences but I did print a JSON object describing the handoff. The
+extractor must fall to ladder step 2 (last balanced {...} object) and recover it
+(TRAILER_STATUS reflects the bare-JSON salvage), exit 0.
+
+{ "what_changed": "Recovered from a bare JSON object (no fence).",
+  "files": ["lib/extract_trailer.py"],
+  "tier": "T1_correctness",
+  "metrics_after": { "tests_pass": 5, "coverage_pct": 50.0, "lint_errors": 0, "bench_p95_ms": 9 },
+  "next_candidate": "add a fence next time",
+  "i_did_NOT": "use the fence",
+  "confidence": 0.4,
+  "done_with_explicit_goals": false }

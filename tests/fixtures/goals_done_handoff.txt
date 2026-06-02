@@ -1,0 +1,17 @@
+All explicit success criteria appear met and I made a real improvement, but per
+LAW 1 the loop never stops; this only sets the agent-side witness for goals_done
+(necessary, NOT sufficient — the harness still requires LEDGER.OPEN empty for
+T1..T6 AND a referee READY, INV-6 / T-SUP-4).
+
+<<<RALPH_HANDOFF
+{
+  "what_changed": "Final coverage bump; all SCs appear met.",
+  "files": ["tests/extra.bats"],
+  "tier": "T2_coverage",
+  "metrics_after": { "tests_pass": 200, "coverage_pct": 95.0, "lint_errors": 0, "bench_p95_ms": 150 },
+  "next_candidate": "T7 probe: look for an untested edge case",
+  "i_did_NOT": "stop the loop",
+  "confidence": 0.9,
+  "done_with_explicit_goals": true
+}
+RALPH_HANDOFF>>>
