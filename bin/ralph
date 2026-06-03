@@ -711,14 +711,40 @@ cmd_watch() {
       exec tail -n 40 -f "$sup"
       ;;
     here)
-      # Inline live panel: status header + the latest per-iteration explanations from PROGRESS.md.
+      # Event-driven LIVE FEED — NO screen-clear, NO flicker. It polls quietly and prints a new entry
+      # ONLY when something CHANGES: a new iteration lands (with its task + verdict), or the status/health
+      # changes. Each completed iteration also rings the bell + pops a macOS notification. Ctrl-C to exit.
+      local last_iter="" last_status="" j cur_iter cur_status cur_class cur_stall task verdict
+      printf '═══ ralph watch — %s ═══   (live · updates ONLY on change · Ctrl-C to exit)\n\n' "$(basename "$target")"
+      j="$("$self" status "$target" --json 2>/dev/null)"
+      cur_iter="$(printf '%s' "$j"   | sed -n 's/.*"iteration":"\([0-9]*\)".*/\1/p')"
+      cur_status="$(printf '%s' "$j" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+      printf '[%s] watching — at iteration %s (%s). Quiet until the next change…\n' \
+        "$(date '+%H:%M:%S')" "${cur_iter:-?}" "${cur_status:-?}"
+      last_iter="$cur_iter"; last_status="$cur_status"
       while true; do
-        clear 2>/dev/null || true
-        printf '═══ ralph watch — %s ═══   (Ctrl-C to exit)\n' "$(basename "$target")"
-        "$self" status "$target" 2>/dev/null | sed -n '2,9p'
-        printf '\n─── WHAT IT DID (latest iterations · .ralph/PROGRESS.md) ───────────────────\n'
-        if [ -f "$prog" ]; then tail -n 26 "$prog"; else printf '(no PROGRESS.md entries yet — first iteration in flight)\n'; fi
-        /usr/bin/perl -e 'select(undef,undef,undef,4)' 2>/dev/null || sleep 4 2>/dev/null || true
+        /usr/bin/perl -e 'select(undef,undef,undef,5)' 2>/dev/null || sleep 5
+        j="$("$self" status "$target" --json 2>/dev/null)"
+        cur_iter="$(printf '%s' "$j"   | sed -n 's/.*"iteration":"\([0-9]*\)".*/\1/p')"
+        cur_status="$(printf '%s' "$j" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+        cur_class="$(printf '%s' "$j"  | sed -n 's/.*"last_class":"\([^"]*\)".*/\1/p')"
+        cur_stall="$(printf '%s' "$j"  | sed -n 's/.*"stalled":\([a-z]*\).*/\1/p')"
+        if [ -n "$cur_iter" ] && [ "$cur_iter" != "$last_iter" ]; then
+          task="$(grep -E '^- \*\*Task\*\*' "$prog" 2>/dev/null | tail -1 | sed 's/^- \*\*Task\*\*: *//')"
+          verdict="$(grep -E 'VERDICT .* (ACCEPTED|REJECTED)' "$prog" 2>/dev/null | tail -1 | sed 's/^:: *//')"
+          printf '\n[%s] ✅ iteration %s done  (class=%s)\n' "$(date '+%H:%M:%S')" "$cur_iter" "${cur_class:-?}"
+          [ -n "$task" ]    && printf '        task    : %s\n' "$task"
+          [ -n "$verdict" ] && printf '        verdict : %s\n' "$verdict"
+          printf '\a'
+          command -v osascript >/dev/null 2>&1 && \
+            osascript -e "display notification \"iteration $cur_iter · $cur_class\" with title \"Ralph · $(basename "$target")\" sound name \"Glass\"" >/dev/null 2>&1 &
+          last_iter="$cur_iter"
+        fi
+        if [ "$cur_status" != "$last_status" ] || [ "$cur_stall" = "true" ]; then
+          printf '[%s] ⚠ status: %s (class=%s, stalled=%s)\n' \
+            "$(date '+%H:%M:%S')" "${cur_status:-?}" "${cur_class:-?}" "${cur_stall:-?}"
+          last_status="$cur_status"
+        fi
       done
       ;;
     gui)
