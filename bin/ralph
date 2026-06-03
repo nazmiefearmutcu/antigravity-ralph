@@ -365,13 +365,21 @@ MISSION
   if [ ! -f "$target/.agent/workflows/ralphloop.md" ]; then
     cat > "$target/.agent/workflows/ralphloop.md" <<'WF'
 ---
-description: Never-stop Ralph loop on THIS repo — one strictly-better VERIFIED unit per turn, state externalized to .ralph/. For unattended/forever runs use `ralph start "$PWD" --daemon`.
+description: Start the NEVER-STOPPING Ralph engine on THIS repo. /ralphloop launches the headless daemon (ralph start --daemon) that improves the repo FOREVER — fresh-context iterations, a metric ratchet that auto-reverts regressions, and automatic recovery from any agy stall/timeout. It does NOT stop until you run `ralph stop`.
 ---
-# /ralphloop
-Until the user says stop, repeat: read .ralph/{MISSION,HANDOFF,LEDGER,RATCHET}.* first; pick ONE unit
-that makes the repo STRICTLY BETTER than HEAD (real fix → coverage → hardening → docs); implement it;
-VERIFY for real; append to .ralph/PROGRESS.md + update .ralph/LEDGER.md; commit only if strictly-better
-and verified; never stop to summarize — go again. Headless engine: `ralph start "$PWD" --daemon`.
+# /ralphloop — start the never-stop engine
+A single agy chat session cannot run forever (it stalls or ends), so do NOT loop inside this chat —
+LAUNCH THE EXTERNAL DAEMON, which is immortal and auto-recovers from agy stalls/timeouts. Do EXACTLY
+this, each command FOREGROUND and returning immediately (never background-poll):
+1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
+2. ralph start "$PWD" --daemon                  # start the never-stopping daemon (idempotent)
+3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
+Then tell the user it is running forever in the BACKGROUND (that is what makes it never-stop +
+stall-proof) and how to FOLLOW IT LIVE from the IDE terminal — `ralph status "$PWD" --watch` (live
+dashboard, refreshes every 2s) or `ralph tail "$PWD"` (streams every iteration) — plus how to stop
+(`ralph stop "$PWD"`). You are DONE — the daemon owns the loop and survives this chat closing; do not
+iterate/poll/summarize here. If status shows NOT alive (sandbox blocked the launch), tell the user to
+run `ralph start "$PWD" --daemon` once in a plain terminal.
 Hard limits: no financial actions; no broad `rm -rf`; no force-push to main; no DB drop; no push to a
 remote the user doesn't own.
 WF

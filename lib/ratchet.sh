@@ -647,7 +647,9 @@ revert_to_baseline() {
       git clean -fdx -e '.ralph' -e 'cache' >/dev/null 2>&1
       ;;
     revert_commit)
-      git revert --no-edit "$(git rev-parse HEAD 2>/dev/null)" >/dev/null 2>&1
+      # core.hooksPath=/dev/null: a harness-internal revert must not run the target repo's commit hooks —
+      # an unbounded hanging hook here would freeze the loop body (INV-5). </dev/null denies blocking stdin.
+      git -c core.hooksPath=/dev/null revert --no-edit "$(git rev-parse HEAD 2>/dev/null)" </dev/null >/dev/null 2>&1
       ;;
     *)
       git reset --hard "$base" >/dev/null 2>&1
@@ -880,14 +882,23 @@ run_one_iteration() {
   fi
 
   # STEP C — DID THE AGENT CHANGE / COMMIT ANYTHING?
+  # Compare RESOLVED revisions, not raw strings: BASE_COMMIT arrives as a SHORT sha (the supervisor
+  # captures sha_before with `git rev-parse --short`), while HEAD here is FULL. A raw `short = full`
+  # string test is ALWAYS false on a true no-op, mis-routing a do-nothing iteration into the REVERT
+  # branch (mislabelled a regression) and starving the noop_streak→tier-escalation lever. Resolve both.
   if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null \
      && [ -z "$(git status --porcelain 2>/dev/null | grep -vE '^.. (\.ralph/|cache/)' || true)" ] \
-     && [ "$BASE_COMMIT" = "$(git rev-parse HEAD 2>/dev/null || echo none)" ]; then
+     && [ "$(git rev-parse "$BASE_COMMIT" 2>/dev/null || echo base)" = "$(git rev-parse HEAD 2>/dev/null || echo none)" ]; then
     handle_noop "$N"; return 0
   fi
   if ! git diff --quiet HEAD 2>/dev/null; then          # agent forgot to commit → harness commits it
     git add -A >/dev/null 2>&1
-    git commit -q -m "ralph(iter $N): auto-commit agent working tree [agent forgot to commit]" >/dev/null 2>&1 || true
+    # core.hooksPath=/dev/null + --no-verify: this is an INTERNAL bookkeeping commit; it must NEVER run the
+    # TARGET repo's git hooks. An UNBOUNDED hanging pre-commit/commit-msg hook here would freeze
+    # run_one_iteration and thus the whole supervisor — even STOP/SIGTERM can't drain a body wedged inside
+    # a foreground git child (the trap is deferred). </dev/null also denies a hook any blocking stdin.
+    git -c core.hooksPath=/dev/null commit -q --no-verify \
+      -m "ralph(iter $N): auto-commit agent working tree [agent forgot to commit]" </dev/null >/dev/null 2>&1 || true
   fi
   local CAND_COMMIT; CAND_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo none)"
 

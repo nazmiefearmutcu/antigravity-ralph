@@ -232,3 +232,28 @@ class Broken(unittest.TestCase):
   after_streak="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" noop_streak 0)"
   [ "$after_streak" -ge "$before_streak" ]
 }
+
+@test "T-NOOP-SHORT (P6 regression): a SHORT base sha (as the supervisor passes) routes a true no-op to handle_noop, NOT REVERT" {
+  # The supervisor exports RALPH_BASE_COMMIT from `git rev-parse --short HEAD` (bin/ralph-supervisor.sh),
+  # so in production BASE_COMMIT is SHORT while STEP C's HEAD is FULL. The old raw short-vs-full string
+  # compare was ALWAYS false on a true no-op → mis-routed the do-nothing iteration into the REVERT branch
+  # (mislabelled a regression, noop_streak never bumped → tier-escalation lever dead). P6 compares resolved
+  # revisions so the no-op is detected. This test mirrors the supervisor's SHORT sha to lock that fix.
+  require_lib ratchet.sh
+  require_fn run_one_iteration
+  require_cmd python3
+  e2e_setup 3
+  base="$(git -C "$WS/repo" rev-parse --short HEAD)"     # SHORT, exactly like the supervisor
+  export RALPH_BASE_COMMIT="$base"
+  before_streak="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" noop_streak 0)"
+  before_reverts="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" reverts 0)"
+  STUB_AGY_FIXTURE="$RALPH_FIXTURES/noop.txt" \
+  agy -p "x" --add-dir "$WS/repo" > "${BATS_TEST_TMPDIR}/out.txt" 2>/dev/null || true
+  stage_iter_stdout "${BATS_TEST_TMPDIR}/out.txt" >/dev/null
+  run run_one_iteration
+  after_streak="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" noop_streak 0)"
+  after_reverts="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" reverts 0)"
+  [ "$(git_head "$WS/repo")" = "$(git -C "$WS/repo" rev-parse "$base")" ]   # HEAD unchanged
+  [ "$after_streak" -gt "$before_streak" ]               # NOOP path taken (streak++), the P6 discriminator
+  [ "$after_reverts" -eq "$before_reverts" ]             # NOT the REVERT path the old short-vs-full bug hit
+}
