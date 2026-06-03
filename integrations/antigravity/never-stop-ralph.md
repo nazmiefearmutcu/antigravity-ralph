@@ -1,6 +1,6 @@
 ---
-name: never-stop-ralph
-trigger: "/ralph" or "keep improving this repo until I say stop"
+name: ralphloop
+trigger: "/ralphloop" or "/ralph" or "keep improving this repo until I say stop"
 description: Run the Ralph discipline in-IDE — one strictly-better unit per turn, externalize state to files, never pause for a summary.
 ---
 # Never-Stop Ralph (in-IDE)
