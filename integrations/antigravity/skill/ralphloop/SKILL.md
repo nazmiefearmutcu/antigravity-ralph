@@ -1,30 +1,29 @@
 ---
 name: ralphloop
-description: Start the NEVER-STOPPING Ralph engine on THIS repo. Use when the user types /ralphloop or says "keep improving until I stop" / "never stop". Launches the background daemon (ralph start --daemon) that improves the repo FOREVER and auto-recovers from any agy stall/timeout; the user follows it LIVE from a terminal via `ralph status <repo> --watch` or `ralph tail <repo>`. It does NOT stop until the user runs `ralph stop`.
+description: Start the NEVER-STOPPING Ralph engine on THIS repo. Use when the user types /ralphloop or says "keep improving until I stop" / "never stop". Launches the background daemon (ralph start --daemon), opens a LIVE monitor window (ralph watch: status + per-iteration journal), and runs FOREVER auto-recovering from stalls; stop with /ralphstop or `ralph stop`.
 ---
 # /ralphloop — start the never-stop engine
 
 When the user types /ralphloop they want THIS repo to start improving itself FOREVER and to NOT stop
-until they stop it. A single agy chat session CANNOT do that — it stalls or ends — so DO NOT loop in
-this conversation. Instead LAUNCH THE EXTERNAL DAEMON: it runs in the BACKGROUND (that is precisely
-what makes it never-stop + stall-proof), and the user FOLLOWS IT LIVE from any terminal.
+until they stop it. A single agy chat session CANNOT do that (it stalls/ends), so DO NOT loop here —
+LAUNCH THE EXTERNAL DAEMON: it runs in the BACKGROUND (that is what makes it never-stop + stall-proof)
+and a LIVE monitor window shows the user what it does each iteration.
 
-Do EXACTLY this, in order. Run each in the FOREGROUND; each returns immediately (never background-poll):
+Do EXACTLY this, in order. Each command runs in the FOREGROUND and returns immediately (never background-poll):
 1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
 2. ralph start "$PWD" --daemon                  # start the never-stopping background daemon (idempotent)
 3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
+4. ralph watch "$PWD"                            # OPEN a live monitor WINDOW (status + per-iteration journal); returns immediately
 
-Then tell the user EXACTLY this (these are the commands they run in the IDE's integrated terminal to
-WATCH THE LOOP LIVE — the work runs in the daemon, the terminal is their live window into it):
-  "✅ Never-stop Ralph engine is running in the background (pid + iteration above). It keeps improving
-   this repo FOREVER and auto-recovers from any agy stall/timeout — it will NOT stop until you stop it.
-   It runs as a background daemon ON PURPOSE: that is what lets it survive stalls and run forever. Watch
-   it LIVE from a terminal (Antigravity ▸ Terminal):
-     • Live dashboard (refreshes every 2s):   ralph status \"$PWD\" --watch
-     • Live iteration-by-iteration stream:     ralph tail \"$PWD\"
-     • The full journal of what it changed:    cat \"$PWD/.ralph/PROGRESS.md\"
-     • Stop it:                                ralph stop \"$PWD\"   (or: touch .ralph/STOP)"
+Then tell the user EXACTLY this:
+  "✅ Never-stop Ralph engine is running in the background (pid + iteration above), and a LIVE monitor
+   window just opened — it shows the status AND what it did each iteration (Task/Changes/Verification/
+   Decision from .ralph/PROGRESS.md), refreshing live. It keeps improving this repo FOREVER and
+   auto-recovers from any agy stall/timeout.
+     • If the window didn't open, run in a terminal:  ralph watch \"$PWD\"
+     • Raw engine log stream:                          ralph tail \"$PWD\"
+     • STOP it any time:  type /ralphstop   (or run:  ralph stop \"$PWD\")"
 
-You are DONE after that — do NOT iterate/poll/summarize here; the daemon owns the loop and survives this
-chat closing. If `ralph status` shows it is NOT alive (sandbox blocked the launch), tell the user to run
+You are DONE after that — do NOT iterate/poll/summarize here; the daemon owns the loop and survives
+this chat closing. If `ralph status` shows NOT alive (sandbox blocked the launch), tell the user to run
 `ralph start "$PWD" --daemon` once in a plain terminal. (`ralph` = the antigravity-ralph repo's bin/ralph.)
