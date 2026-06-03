@@ -411,26 +411,75 @@ main() {
         continue                                       # retry SAME iteration; floor untouched (R8)
         ;;
       timeout)
-        bump consecutive_failures; record_crashloop_event
-        log "TIMEOUT iter=$ITER → reclaim wedged work & advance"
-        revert_dirty_to "$sha_before"                  # abandon wedged partial work
-        local _cf; _cf="$(get_state consecutive_failures)"; case "$_cf" in ''|*[!0-9]*) _cf=1 ;; esac
-        backoff_s="$(min 120 $((30 * _cf)))"
-        set_state backoff_s "$backoff_s"
-        phase=backoff; heartbeat
-        sleep_interruptible "$backoff_s"
-        ITER=$((ITER + 1)); set_state iteration "$ITER" # unit wedged → advance to a fresh task (R8)
+        # A timeout = agy's cooperative --print-timeout/deadline, its SIGNATURE soft response-timeout
+        # ("timed out waiting for response", rc 143), or the bounded_run wall-clock kill (rc 124). On
+        # long units agy OFTEN finishes the work and COMMITS *before* the wrapper reports the timeout,
+        # so a timeout is NOT inherently lost work. Decide by whether HEAD moved:
+        #   • HEAD moved  → agy committed a real candidate. Run the §5 ratchet to keep-if-strictly-better
+        #     (or revert) EXACTLY like success — never `git reset --hard` a committed unit blindly.
+        #   • HEAD same   → genuinely wedged / nothing produced. Reclaim the dirty tree and back off.
+        # EITHER WAY advance the iteration (R8). The old code routed agy's soft-timeout to transient_crash
+        # (`continue`, retry the SAME iter forever) — wedging the loop at iter 0; advancing here is the fix.
+        set_state consecutive_quota_hits 0
+        if [ "$sha_after" != "$sha_before" ] && [ "$sha_before" != none ] && [ "$sha_after" != none ]; then
+          set_state consecutive_failures 0
+          backoff_s=0; set_state backoff_s 0
+          export RALPH_BASE_COMMIT="$sha_before"
+          log "TIMEOUT iter=$ITER but agy committed ${sha_before}->${sha_after} → ratchet the candidate, advance"
+          run_one_iteration || log "run_one_iteration returned non-zero (handled, loop continues)"
+          unset RALPH_BASE_COMMIT
+          set_state last_success_iso "$(now)"
+        else
+          bump consecutive_failures; record_crashloop_event
+          log "TIMEOUT iter=$ITER (no commit) → reclaim wedged work, backoff & advance"
+          revert_dirty_to "$sha_before"                  # abandon wedged partial work
+          local _cf; _cf="$(get_state consecutive_failures)"; case "$_cf" in ''|*[!0-9]*) _cf=1 ;; esac
+          backoff_s="$(min 120 $((30 * _cf)))"
+          set_state backoff_s "$backoff_s"
+          phase=backoff; heartbeat
+          sleep_interruptible "$backoff_s"
+        fi
+        ITER=$((ITER + 1)); set_state iteration "$ITER" # unit resolved → advance to a fresh task (R8)
         [ "${RALPH_ONCE:-0}" = 1 ] && { log "RALPH_ONCE: one unit resolved (timeout) → draining"; WANT_STOP=1; }
         ;;
       transient_crash)
+        # A genuine non-zero crash with no recognized timeout/quota/fatal signal. R8: NORMALLY retry the
+        # SAME iteration (a substrate hiccup that recovery clears). Two guarantees keep this from ever
+        # WEDGING the loop (the never-progress arm of INV-5), symmetric with the timeout fix above:
+        #   • commit-aware: if agy committed before crashing (HEAD moved), ratchet the candidate + advance
+        #     instead of blindly `git reset --hard`-ing real work away.
+        #   • forced-advance escape hatch: a DETERMINISTIC crash that repeats on one poison unit must not
+        #     freeze ITER forever. After RALPH_CRASHLOOP_THRESHOLD consecutive failures on this iter we
+        #     abandon the unit and advance to a fresh task (loud, still immortal — never `exit`).
         bump consecutive_failures; record_crashloop_event
-        revert_dirty_to "$sha_before"; recover_agy_substrate
-        backoff_s="$(expo_backoff_jitter "$(get_state consecutive_failures)")"
-        set_state backoff_s "$backoff_s"
-        phase=backoff; heartbeat
-        log "TRANSIENT_CRASH rc=$rc → recover+backoff ${backoff_s}s (retry SAME iter $ITER)"
-        sleep_interruptible "$backoff_s"
-        continue                                       # retry SAME iteration (R8)
+        recover_agy_substrate
+        if [ "$sha_after" != "$sha_before" ] && [ "$sha_before" != none ] && [ "$sha_after" != none ]; then
+          set_state consecutive_failures 0
+          backoff_s=0; set_state backoff_s 0
+          export RALPH_BASE_COMMIT="$sha_before"
+          log "TRANSIENT_CRASH rc=$rc but agy committed ${sha_before}->${sha_after} → ratchet the candidate, advance"
+          run_one_iteration || log "run_one_iteration returned non-zero (handled, loop continues)"
+          unset RALPH_BASE_COMMIT
+          set_state last_success_iso "$(now)"
+          ITER=$((ITER + 1)); set_state iteration "$ITER"
+        else
+          revert_dirty_to "$sha_before"
+          local _cf; _cf="$(get_state consecutive_failures)"; case "$_cf" in ''|*[!0-9]*) _cf=1 ;; esac
+          backoff_s="$(expo_backoff_jitter "$_cf")"
+          set_state backoff_s "$backoff_s"
+          phase=backoff; heartbeat
+          if [ "$_cf" -ge "$RALPH_CRASHLOOP_THRESHOLD" ]; then
+            log "TRANSIENT_CRASH rc=$rc → $_cf consecutive on iter $ITER (poison unit) → abandon & ADVANCE (never wedge)"
+            set_state consecutive_failures 0; reset_crashloop_window
+            sleep_interruptible "$backoff_s"
+            ITER=$((ITER + 1)); set_state iteration "$ITER"
+          else
+            log "TRANSIENT_CRASH rc=$rc → recover+backoff ${backoff_s}s (retry SAME iter $ITER)"
+            sleep_interruptible "$backoff_s"
+            continue                                   # retry SAME iteration (R8)
+          fi
+        fi
+        [ "${RALPH_ONCE:-0}" = 1 ] && { log "RALPH_ONCE: one unit resolved (transient) → draining"; WANT_STOP=1; }
         ;;
       fatal_misconfig)
         bump consecutive_failures
@@ -440,14 +489,23 @@ main() {
         continue                                       # a human/launchd env-fix may resolve it
         ;;
       *)
-        # Unknown class: treat as transient so the loop never dies (INV-5).
+        # Unknown class: treat as transient so the loop never dies (INV-5) — WITH the same forced-advance
+        # escape hatch as transient_crash so an unrecognized repeating failure cannot wedge ITER forever.
         bump consecutive_failures; record_crashloop_event
-        log "UNKNOWN class='$class' rc=$rc → treat as transient"
         revert_dirty_to "$sha_before"
-        backoff_s="$(expo_backoff_jitter "$(get_state consecutive_failures)")"
-        set_state backoff_s "$backoff_s"
-        sleep_interruptible "$backoff_s"
-        continue
+        local _cu; _cu="$(get_state consecutive_failures)"; case "$_cu" in ''|*[!0-9]*) _cu=1 ;; esac
+        backoff_s="$(expo_backoff_jitter "$_cu")"
+        set_state backoff_s "$backoff_s"; phase=backoff; heartbeat
+        if [ "$_cu" -ge "$RALPH_CRASHLOOP_THRESHOLD" ]; then
+          log "UNKNOWN class='$class' rc=$rc → $_cu consecutive on iter $ITER → abandon & ADVANCE (never wedge)"
+          set_state consecutive_failures 0; reset_crashloop_window
+          sleep_interruptible "$backoff_s"
+          ITER=$((ITER + 1)); set_state iteration "$ITER"
+        else
+          log "UNKNOWN class='$class' rc=$rc → treat as transient, backoff ${backoff_s}s (retry SAME iter $ITER)"
+          sleep_interruptible "$backoff_s"
+          continue
+        fi
         ;;
     esac
 

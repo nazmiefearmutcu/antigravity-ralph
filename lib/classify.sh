@@ -42,8 +42,9 @@ fi
 #   Decision order (first match wins), faithful to §7.4:
 #     1. rc == 124                      -> timeout            (bounded_run wall-clock kill)
 #     2. transcript mentions rate/quota -> rate_limit         (even on rc 0: silent zombie)
-#     3. transcript mentions print-timeout/deadline -> timeout
+#     3. transcript mentions print-timeout/deadline OR agy "timed out waiting for response" -> timeout
 #     4. rc != 0 AND (agy missing OR fatal-language) -> fatal_misconfig
+#     4b. rc == 143 or 137 (signaled soft-exit)      -> timeout  (text-independent robust net)
 #     5. rc == 0                        -> success
 #     6. otherwise                      -> transient_crash
 classify_result() {
@@ -67,8 +68,17 @@ classify_result() {
     return 0
   fi
 
-  # 3. Cooperative print-timeout / deadline language.
-  if printf '%s' "$tail" | grep -Eq 'print.?timeout|deadline exceeded|context deadline'; then
+  # 3. Cooperative timeout: agy's own --print-timeout/deadline, OR its SIGNATURE soft response-timeout
+  #    ("timed out waiting for response") that exits non-zero (rc 143) AFTER it may have already
+  #    committed a unit. BOTH are `timeout` — the supervisor ADVANCES the iteration and ratchets any
+  #    committed candidate. They are NOT transient_crash: that class `continue`s the SAME iteration
+  #    forever, so a soft-timeout (agy's *normal* end-of-run on long units) would wedge the loop at
+  #    iter 0 and feed the crash-loop cooldown until the whole loop looks dead (§7.4, the never-progress bug).
+  # NOTE: the soft-timeout phrase is the FULL agy signature "timed out waiting for response" (not the bare
+  # "timed out waiting" prefix) so a SUCCESSFUL rc==0 run that merely narrates "...timed out waiting for the
+  # background task..." is NOT demoted to timeout. The rc 143/137 rule below is the text-independent net that
+  # catches agy's real soft-exits even when the phrase is worded differently or pushed out of the 4 KB tail.
+  if printf '%s' "$tail" | grep -Eq 'print.?timeout|deadline exceeded|context deadline|timed out waiting for response|response timed out'; then
     echo timeout
     return 0
   fi
@@ -84,6 +94,17 @@ classify_result() {
       return 0
     fi
   fi
+
+  # 4c. Signaled soft-exit: rc 143 (SIGTERM) / 137 (SIGKILL). agy's own deadline fired, the
+  #     language_server killed it, or the OS did. Route to the commit-aware `timeout` branch (which
+  #     ratchets a commit or reclaims + ADVANCES the iteration) rather than transient_crash — whose
+  #     retry-SAME-iter would WEDGE the loop if the kill recurs. This is INDEPENDENT of transcript text:
+  #     agy's "timed out waiting for response" phrase may be absent, localized, or pushed out of the 4 KB
+  #     tail window by trailing output, so the rc-based rule (not the text grep above) is the robust net.
+  #     Placed AFTER the fatal-language check so an explicit misconfig still wins; before success/transient.
+  case "$rc" in
+    143|137) echo timeout; return 0 ;;
+  esac
 
   # 5. Clean success.
   if [ "$rc" -eq 0 ]; then

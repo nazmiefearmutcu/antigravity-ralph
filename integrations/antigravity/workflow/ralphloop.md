@@ -1,27 +1,31 @@
 ---
-description: Never-stop Ralph loop on THIS repo — one strictly-better VERIFIED unit per turn, state in .ralph/. Headless: `ralph start "$PWD" --daemon`.
+description: Start the NEVER-STOPPING Ralph engine on THIS repo. /ralphloop launches the headless daemon (ralph start --daemon) that improves the repo FOREVER — fresh-context iterations, a metric ratchet that auto-reverts regressions, and automatic recovery from any agy stall/timeout. It does NOT stop until you run `ralph stop`.
 ---
+# /ralphloop — start the never-stop engine
 
-You are one iteration of an unstoppable self-improvement loop on the current git repo.
+When the user types /ralphloop they want THIS repo to start improving itself FOREVER and to NOT stop
+until they stop it. A single agy chat session cannot do that — it stalls or ends — so DO NOT try to
+loop inside this conversation. Instead LAUNCH THE EXTERNAL DAEMON: it is immortal, runs in fresh
+contexts, auto-reverts regressions via a metric ratchet, and AUTO-RECOVERS from any agy stall/timeout.
 
-If a `.ralph/` directory does not exist yet, bootstrap it first by telling the user to run
-`ralph init "$PWD"` (or run it yourself if `ralph` is on PATH), then continue.
+Do EXACTLY this, in order. Run each in the FOREGROUND; each returns immediately (never background-poll):
 
-Until the user types an explicit stop word, repeat:
-1. READ state from disk first (never trust memory): `.ralph/MISSION.md`, `.ralph/HANDOFF.md`,
-   `.ralph/LEDGER.md` (OPEN items), the last 3 `.ralph/PROGRESS.md` blocks, `.ralph/RATCHET.json`.
-2. Pick ONE unit that makes the next handoff STRICTLY BETTER than HEAD — real bug fix → real test
-   coverage → hardening → perf → docs. No cosmetic busywork; respect every RATCHET floor.
-3. Implement it. VERIFY for real (run the verify command; never claim a pass you did not observe).
-4. APPEND (never overwrite) one ITER block to `.ralph/PROGRESS.md`; update `.ralph/LEDGER.md`
-   (OPEN→DONE on success; add a REJECTED entry with WHY if an approach failed).
-5. Commit ONLY if it is strictly-better and verified. Do not edit anything under `.ralph/` except
-   PROGRESS.md and LEDGER.md.
-6. Do NOT stop to summarize. Immediately go to step 1.
+1. Scaffold if needed (no-op if already set up):
+       ralph init "$PWD" 2>/dev/null || true
+2. Start the never-stopping daemon (idempotent — if one is already running it just says so):
+       ralph start "$PWD" --daemon
+3. Confirm it is ALIVE and show pid + current iteration:
+       ralph status "$PWD"
+4. Show recent progress so the user sees it working:
+       tail -n 20 "$PWD/.ralph/PROGRESS.md" 2>/dev/null || true
 
-Hard limits: no financial actions; no `rm -rf` on broad paths; no force-push to main; no DB drop;
-never push to a remote the user does not own.
+Then tell the user briefly:
+  "✅ Never-stop Ralph engine is running (pid + iteration above). It keeps improving this repo FOREVER
+   and auto-recovers from any agy stall/timeout — it will NOT stop until you stop it.
+     • Watch:  ralph status \"$PWD\"   ·   tail -f .ralph/logs/supervisor.log   ·   .ralph/PROGRESS.md
+     • Stop:   ralph stop \"$PWD\"      (or: touch .ralph/STOP)"
 
-To run this UNATTENDED and forever (the real engine: fresh-context iterations + a git-backed metric
-ratchet that auto-reverts any regression), tell the user:  `ralph start "$PWD" --daemon`
-Repo: https://github.com/nazmiefearmutcu/antigravity-ralph
+You are DONE after that. The daemon owns the loop and runs even after this chat closes — do NOT iterate
+here, do NOT poll/wait, do NOT keep summarizing. If `ralph status` shows it is NOT alive (e.g. the
+sandbox blocked the background launch), tell the user to run `ralph start "$PWD" --daemon` once in a
+plain terminal — then it runs forever. (`ralph` = the antigravity-ralph repo's bin/ralph if not on PATH.)
