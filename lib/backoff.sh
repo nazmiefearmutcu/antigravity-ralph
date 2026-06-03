@@ -168,6 +168,11 @@ enforce_min_interval() {
       *[!0-9]* | "" ) last=0 ;;
     esac
     diff=$((now - last))
+    # Clamp a NEGATIVE diff (last_run_started.epoch is in the future: clock stepped backward via NTP/manual,
+    # or a corrupt-but-numeric stamp). Otherwise minsec-diff = minsec+|skew| and we'd sleep for hours. Treat
+    # a future stamp as "interval already satisfied". (STOP still wakes us in ~2s either way, but this avoids
+    # a needless multi-hour throttle; the stamp is rewritten to now() below so it self-heals next iteration.)
+    [ "$diff" -lt 0 ] && diff="$minsec"
     if [ "$diff" -lt "$minsec" ]; then
       sleep_interruptible $((minsec - diff))
     fi

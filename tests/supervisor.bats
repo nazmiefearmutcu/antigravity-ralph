@@ -109,3 +109,35 @@ iter_now() { "$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/state.json" i
   gd="$("$PY3" "$RALPH_LIB/state.py" get-raw "$WS/repo/.ralph/RATCHET.json" goals_done false)"
   [ "$gd" != "true" ]
 }
+
+@test "T-SUP-5 (never-progress regression): agy soft-timeout that COMMITTED advances the iteration" {
+  # agy did work + committed, then the wrapper reported rc 143 "timed out waiting for response".
+  # classify ⇒ timeout (NOT transient_crash) ⇒ the loop ratchets the committed candidate and ADVANCES.
+  # Pre-fix this was transient_crash → `continue` → iter stuck at 0 forever (the "only iterates a couple
+  # of times then looks dead" bug). With MAX_ITERATIONS=1 a correct loop advances to 1 and exits cleanly.
+  export STUB_AGY_FIXTURE="$RALPH_FIXTURES/soft_timeout.txt" STUB_AGY_EXIT=143 STUB_AGY_COMMIT=1
+  export RALPH_MAX_ITERATIONS=1 RALPH_MIN_INTERVAL_S=1 RALPH_BACKOFF_BASE_S=1 RALPH_BACKOFF_CAP_S=1
+  run_supervisor_bounded 30
+  [ "$(iter_now)" -ge 1 ]
+}
+
+@test "T-SUP-6 (never-progress regression): agy soft-timeout with NO commit still advances (not retry-forever)" {
+  # The EXACT production failure: agy soft-timed-out before committing (sha unchanged). It must still
+  # ADVANCE (reclaim the dirty tree + move to the next task), never re-run the identical prompt forever.
+  export STUB_AGY_FIXTURE="$RALPH_FIXTURES/soft_timeout.txt" STUB_AGY_EXIT=143
+  export RALPH_MAX_ITERATIONS=1 RALPH_MIN_INTERVAL_S=1 RALPH_BACKOFF_BASE_S=1 RALPH_BACKOFF_CAP_S=1
+  run_supervisor_bounded 25
+  [ "$(iter_now)" -ge 1 ]
+}
+
+@test "T-SUP-7 (never-WEDGE): a DETERMINISTIC transient_crash is abandoned after the threshold and ADVANCES" {
+  # A poison unit: agy reproducibly crashes non-zero with NO timeout/quota/fatal keyword (⇒ transient_crash)
+  # and commits nothing. Pre-hardening this `continue`d the SAME iter forever (wedge). The forced-advance
+  # escape hatch must abandon the unit after RALPH_CRASHLOOP_THRESHOLD failures and move ITER forward.
+  export STUB_AGY_EXIT=1   # generic crash, no special transcript ⇒ transient_crash every run
+  export RALPH_CRASHLOOP_THRESHOLD=2 RALPH_MAX_ITERATIONS=0 \
+         RALPH_MIN_INTERVAL_S=1 RALPH_BACKOFF_BASE_S=1 RALPH_BACKOFF_CAP_S=1
+  run_supervisor_bounded 25
+  # With threshold=2 the loop abandons the poison iter and advances; it must NOT be stuck at 0.
+  [ "$(iter_now)" -ge 1 ]
+}

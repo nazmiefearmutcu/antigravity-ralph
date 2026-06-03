@@ -1,0 +1,9 @@
+I will add the missing edge-case tests, run pytest with coverage, and commit the result.
+I will re-run the targeted coverage command to verify the new tests raise coverage above the floor.
+Error: timed out waiting for response
+
+(classify.bats / supervisor.bats fixture: agy's SIGNATURE soft response-timeout. The headless
+wrapper prints "timed out waiting for response" and exits 143 AFTER agy may have already committed a
+unit. It MUST classify as `timeout` — so the supervisor advances the iteration and ratchets any
+committed candidate — NOT `transient_crash`, which would `continue` the SAME iteration forever and
+wedge the loop at iter 0 (the never-progress bug this fixture guards against). §7.4.)
