@@ -64,6 +64,31 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+@test "T-BOUND-idle-cpu: a CPU-busy but SILENT child (batched output) is NOT false-killed by the idle watchdog" {
+  # Mirrors agy in --print mode: actively WORKING (burning CPU) but writing NOTHING to the redirected file
+  # until it exits. With BOUNDED_IDLE_S=3 the file stays flat, but the process group's CPU advances each
+  # tick, so the (CPU-aware) watchdog must NOT fire — it returns the child's real rc 0. Guards the
+  # false-kill/work-discard regression a file-growth-only watchdog would cause on a real agy run.
+  # Like T-BOUND-no-orphan, run inside `bash -c 'set -m; …'` so the child is its own pgid leader (bats
+  # does not propagate job control) — pgid==cmd_pid is what the watchdog's group-CPU probe keys on, and is
+  # exactly how the supervisor (which sets -m) invokes bounded_run in production.
+  command -v python3 >/dev/null || skip "python3 not available"
+  burn="${BATS_TEST_TMPDIR}/burn.py"
+  cat > "$burn" <<'PY'
+import time
+t = time.time() + 9
+x = 0
+while time.time() < t:
+    x += 1
+PY
+  run bash -c '
+    set -m
+    . "'"$RALPH_LIB"'/bounded.sh"
+    BOUNDED_IDLE_S=3 bounded_run 30 "'"$LOG"'" -- python3 "'"$burn"'"
+  '
+  [ "$status" -eq 0 ]
+}
+
 @test "T-BOUND-no-orphan: the whole process group is reaped (hung grandchild dies)" {
   # A child that spawns a long-lived grandchild then itself hangs. The group-kill
   # watchdog must reap BOTH. We tag the grandchild so we can grep for survivors.

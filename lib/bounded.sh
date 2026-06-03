@@ -83,12 +83,21 @@ bounded_run() {
     # instead of waiting out the full wall, so the loop self-recovers fast. Belt-and-suspenders with the
     # wall-clock cap below; both group-kill and exit 124 → the supervisor classifies it `timeout` & advances.
     idle="${BOUNDED_IDLE_S:-0}"; case "$idle" in ''|*[!0-9]*) idle=0 ;; esac
-    last_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"; last_grow="$(date +%s 2>/dev/null || echo 0)"
+    # A STALL = no output AND no CPU progress. agy in --print mode BATCHES its output to a redirected
+    # (non-tty) file, so the file can stay flat while agy is actively WORKING (thinking, or a child like
+    # pytest burning CPU). Therefore we ALSO sample the process GROUP's cumulative CPU time (pgid==cmd_pid
+    # under set -m): if EITHER the log grows OR group-CPU advances, the child is alive+working and the idle
+    # clock resets. Only when BOTH stay flat for <idle> seconds — a genuinely wedged/network-blocked agy —
+    # do we kill. This is the fix for the file-growth-only watchdog that FALSE-killed a healthy busy agy.
+    _gcpu() { ps -A -o pgid=,time= 2>/dev/null | awk -v g="$1" '$1==g{n=split($2,a,":"); s=(n>=3)?a[1]*3600+a[2]*60+a[3]:((n==2)?a[1]*60+a[2]:a[1]); t+=s} END{printf "%d", t+0}'; }
+    last_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"; last_cpu="$(_gcpu "$cmd_pid")"; last_grow="$(date +%s 2>/dev/null || echo 0)"
     while [ "$(awk -v r="$rem" 'BEGIN{print (r>0)?1:0}')" = 1 ]; do
       kill -0 "$cmd_pid" 2>/dev/null || exit 0          # target finished/killed → leave promptly
-      if [ "$idle" -gt 0 ]; then                        # no-output stall detection
-        cur_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"
-        if [ "$cur_sz" != "$last_sz" ]; then last_sz="$cur_sz"; last_grow="$(date +%s 2>/dev/null || echo 0)"; fi
+      if [ "$idle" -gt 0 ]; then                        # stall = no output AND no CPU progress
+        cur_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"; cur_cpu="$(_gcpu "$cmd_pid")"
+        if [ "$cur_sz" != "$last_sz" ] || [ "${cur_cpu:-0}" -gt "${last_cpu:-0}" ]; then
+          last_sz="$cur_sz"; last_cpu="$cur_cpu"; last_grow="$(date +%s 2>/dev/null || echo 0)"
+        fi
         if [ "$(( $(date +%s 2>/dev/null || echo 0) - last_grow ))" -ge "$idle" ]; then
           kill -TERM -"$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null
           "$RALPH_PERL" -e 'select(undef,undef,undef,5)'
