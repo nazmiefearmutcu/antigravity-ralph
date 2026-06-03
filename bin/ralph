@@ -374,11 +374,11 @@ this, each command FOREGROUND and returning immediately (never background-poll):
 1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
 2. ralph start "$PWD" --daemon                  # start the never-stopping daemon (idempotent)
 3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
-4. ralph watch "$PWD"                            # OPEN a live monitor window (status + per-iteration journal); returns at once
+4. ralph console "$PWD"                          # OPEN the live monitor + CHAT console window; returns at once
 Then tell the user it is running forever in the BACKGROUND (that is what makes it never-stop +
-stall-proof), that a LIVE monitor window opened showing WHAT IT DID each iteration (.ralph/PROGRESS.md),
-and how to stop: type /ralphstop (or run `ralph stop "$PWD"`). If the window didn't open, run
-`ralph watch "$PWD"`; raw engine log is `ralph tail "$PWD"`. You are DONE — the daemon owns the loop and
+stall-proof), that a LIVE monitor + CHAT console window opened where they can just TYPE a directive to
+steer the loop without stopping it, and how to stop: type /ralphstop (or run `ralph stop "$PWD"`). If the
+window didn't open, run `ralph console "$PWD"`. You are DONE — the daemon owns the loop and
 survives this chat closing; do not iterate/poll/summarize here. If status shows NOT alive (sandbox
 blocked the launch), tell the user to run `ralph start "$PWD" --daemon` once in a plain terminal.
 Hard limits: no financial actions; no broad `rm -rf`; no force-push to main; no DB drop; no push to a
@@ -710,6 +710,32 @@ cmd_chat() {
     printf '   ✓ queued (#%d) — the loop will act on it next iteration\n' "$n"
   done
   printf '\nbye — queued %d message(s); the loop kept running the whole time.\n' "$n"
+}
+
+# ── console — combined LIVE monitor + chat box (curses): type to steer the loop, no commands ──────
+cmd_console() {
+  local target; target="$(_say_resolve "${1:-}")" || exit 1
+  [ -n "${1:-}" ] && [ -d "${1:-}/.ralph" ] && shift
+  require_initialized "$target"
+  command -v python3 >/dev/null 2>&1 || { echo "ralph console: needs python3" >&2; exit 1; }
+  [ -f "$RALPH_LIB_DIR/console.py" ] || { echo "ralph console: console.py not found in $RALPH_LIB_DIR" >&2; exit 1; }
+  if [ -t 1 ]; then
+    RALPH_BIN="$RALPH_BIN_DIR/ralph" exec python3 "$RALPH_LIB_DIR/console.py" "$target"   # interactive TTY
+  fi
+  # No TTY (e.g. an agy workflow): pop a Terminal window running the console; never block the caller.
+  if command -v osascript >/dev/null 2>&1; then
+    local inner esc
+    inner="$RALPH_BIN_DIR/ralph console \"$target\""
+    esc="$(printf '%s' "$inner" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    if osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  do script "$esc"
+  activate
+end tell
+OSA
+    then printf 'ralph: opened the live chat+monitor console window for %s.\n' "$(basename "$target")"; return 0; fi
+  fi
+  printf 'ralph: run this in a terminal to open the chat console:\n  ralph console %s\n' "$target"
 }
 
 # ── quota — read the LIVE Antigravity model quota over the running IDE's DevTools/CDP port ─────────
@@ -1262,6 +1288,8 @@ COMMANDS
   status [target] [--json] [--watch]
                      alive/dead/paused, iter, phase, class, failures/reverts, ETA, stalled.
                      exit 0=alive, 1=dead, 2=paused.
+  console [target]   Combined LIVE monitor + CHAT box (curses): watch the loop AND just type to steer
+                     it (queues to .ralph/INBOX.md) — no commands, like a chat. What /ralphloop opens.
   watch [target] [--here|--journal|--log]
                      Open a LIVE monitor window (status + per-iteration PROGRESS journal). Default pops
                      a Terminal window; --here runs inline; --journal streams PROGRESS.md; --log the engine log.
@@ -1308,6 +1336,7 @@ main() {
     once)            cmd_once "$@" ;;
     status)          cmd_status "$@" ;;
     watch)           cmd_watch "$@" ;;
+    console)         cmd_console "$@" ;;
     quota)           cmd_quota "$@" ;;
     say)             cmd_say "$@" ;;
     chat)            cmd_chat "$@" ;;
