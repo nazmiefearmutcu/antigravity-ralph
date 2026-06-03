@@ -1,0 +1,13 @@
+---
+name: ralphsay
+description: Dictate a LIVE directive to the running Ralph loop on THIS repo without stopping it. Use when the user types /ralphsay or wants to steer the loop mid-run ("focus on X", "stop doing Y"). Runs `ralph say` to queue the message into .ralph/INBOX.md; the loop injects it into the next iteration. Never stops the loop.
+---
+# /ralphsay — dictate to the running loop
+
+The user wants to send a LIVE directive to the background Ralph loop on this repo WITHOUT stopping it.
+Take EVERYTHING the user wrote after /ralphsay as the message and run (foreground, returns at once):
+    ralph say "$PWD" "<the user's message verbatim>"
+Then tell the user it is queued and the loop will act on it on its NEXT iteration (it keeps running the
+whole time — this is a side-channel into .ralph/INBOX.md). If the user gave no message, ask what to
+dictate (e.g. "focus on api.py next", "stop adding tests, fix the lint errors", "prioritize security").
+Do NOT stop or restart the loop. You are done after confirming.
