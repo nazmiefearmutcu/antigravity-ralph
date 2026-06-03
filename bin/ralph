@@ -711,40 +711,109 @@ cmd_watch() {
       exec tail -n 40 -f "$sup"
       ;;
     here)
-      # Event-driven LIVE FEED — NO screen-clear, NO flicker. It polls quietly and prints a new entry
-      # ONLY when something CHANGES: a new iteration lands (with its task + verdict), or the status/health
-      # changes. Each completed iteration also rings the bell + pops a macOS notification. Ctrl-C to exit.
-      local last_iter="" last_status="" j cur_iter cur_status cur_class cur_stall task verdict
-      printf '═══ ralph watch — %s ═══   (live · updates ONLY on change · Ctrl-C to exit)\n\n' "$(basename "$target")"
-      j="$("$self" status "$target" --json 2>/dev/null)"
-      cur_iter="$(printf '%s' "$j"   | sed -n 's/.*"iteration":"\([0-9]*\)".*/\1/p')"
-      cur_status="$(printf '%s' "$j" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
-      printf '[%s] watching — at iteration %s (%s). Quiet until the next change…\n' \
-        "$(date '+%H:%M:%S')" "${cur_iter:-?}" "${cur_status:-?}"
-      last_iter="$cur_iter"; last_status="$cur_status"
+      # Rich LIVE dashboard — smooth in-place redraw (cursor-home + clear-to-EOL, NO full-screen clear,
+      # so it updates like top/htop with NO flicker). Shows a spinner + phase ("cooking"), the live agy
+      # activity, elapsed time on the current iteration, an estimated token counter, the REAL last change
+      # (git diff stat), recent verdicts, and a STALL alert (+ macOS notification) when agy stops moving.
+      local st="$target/.ralph/state.json" hb="$target/.ralph/heartbeat.json" ep="$target/.ralph/last_run_started.epoch"
+      local spin='|/-\' si=0
+      local last_iter="" lastchange="" recent="" tok="0" tok_tick=99
+      local last_size="-1" last_grow=0 stall_armed=1
+      printf '\033[2J\033[?25l'                     # one initial clear + hide cursor
+      trap 'printf "\033[?25h\n"; exit 0' INT TERM
+      trap 'printf "\033[?25h"' EXIT
       while true; do
-        /usr/bin/perl -e 'select(undef,undef,undef,5)' 2>/dev/null || sleep 5
-        j="$("$self" status "$target" --json 2>/dev/null)"
-        cur_iter="$(printf '%s' "$j"   | sed -n 's/.*"iteration":"\([0-9]*\)".*/\1/p')"
-        cur_status="$(printf '%s' "$j" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
-        cur_class="$(printf '%s' "$j"  | sed -n 's/.*"last_class":"\([^"]*\)".*/\1/p')"
-        cur_stall="$(printf '%s' "$j"  | sed -n 's/.*"stalled":\([a-z]*\).*/\1/p')"
-        if [ -n "$cur_iter" ] && [ "$cur_iter" != "$last_iter" ]; then
-          task="$(grep -E '^- \*\*Task\*\*' "$prog" 2>/dev/null | tail -1 | sed 's/^- \*\*Task\*\*: *//')"
-          verdict="$(grep -E 'VERDICT .* (ACCEPTED|REJECTED)' "$prog" 2>/dev/null | tail -1 | sed 's/^:: *//')"
-          printf '\n[%s] ✅ iteration %s done  (class=%s)\n' "$(date '+%H:%M:%S')" "$cur_iter" "${cur_class:-?}"
-          [ -n "$task" ]    && printf '        task    : %s\n' "$task"
-          [ -n "$verdict" ] && printf '        verdict : %s\n' "$verdict"
+        local iter class phase stalled aliveword pid
+        iter="$(sed -n 's/.*"iteration":[ ]*\([0-9]*\).*/\1/p' "$st" 2>/dev/null | head -1)"
+        class="$(sed -n 's/.*"last_class":[ ]*"\([^"]*\)".*/\1/p' "$st" 2>/dev/null | head -1)"
+        phase="$(sed -n 's/.*"phase":[ ]*"\([^"]*\)".*/\1/p' "$hb" 2>/dev/null | head -1)"
+        stalled="$(sed -n 's/.*"stalled":[ ]*\([a-z]*\).*/\1/p' "$hb" 2>/dev/null | head -1)"
+        pid="$(cat "$target/.ralph/ralph.pid" 2>/dev/null)"
+        aliveword="dead"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && aliveword="alive"
+
+        # active iteration dir → what it is doing RIGHT NOW + stall watch (is its log still growing?)
+        local cur af act sz nowe idle
+        cur="$(ls -td "$target"/.ralph/iter/*/ 2>/dev/null | head -1)"
+        af="$cur/agy.stdout"; act="(starting…)"; sz=0
+        if [ -n "$cur" ]; then
+          [ -f "$cur/base.verify.1.log" ] && [ "$cur/base.verify.1.log" -nt "$af" ] && af="$cur/base.verify.1.log"
+          if [ -f "$af" ]; then
+            sz="$(stat -f%z "$af" 2>/dev/null || echo 0)"
+            case "$af" in
+              *verify*) act="running the verify suite (pytest)…" ;;
+              *) act="$(grep -avE '^[[:space:]]*[{}"]|RALPH_HANDOFF|^[0-9]+[[:space:]]*$|TRAILER_STATUS|confidence|files|metrics_after|what_changed|next_candidate|i_did_NOT|done_with' "$af" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-76)" ;;
+            esac
+          fi
+          [ -z "$act" ] && act="(thinking…)"
+        fi
+        nowe="$(date +%s)"
+        if [ "$sz" != "$last_size" ]; then last_size="$sz"; last_grow="$nowe"; fi
+        [ "$last_grow" = 0 ] && last_grow="$nowe"
+        idle=$(( nowe - last_grow ))
+        local stall=0
+        { [ "$stalled" = "true" ] || { [ "$phase" = "running_agy" ] && [ "$idle" -ge 240 ]; }; } && stall=1
+
+        # token estimate (sum of prompt.txt + agy.stdout sizes /4) — refreshed every ~5 ticks
+        tok_tick=$(( tok_tick + 1 ))
+        if [ "$tok_tick" -ge 5 ]; then
+          tok="$(find "$target"/.ralph/iter \( -name prompt.txt -o -name agy.stdout \) -print0 2>/dev/null | xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END{print int(s/4)}')"
+          [ -z "$tok" ] && tok=0
+          tok_tick=0
+        fi
+        local tokc; tokc="$(printf '%s' "$tok" | sed -e ':a' -e 's/\B[0-9]\{3\}\>/,&/;ta' 2>/dev/null)"; [ -z "$tokc" ] && tokc="$tok"
+
+        # elapsed on the current iteration
+        local startep elapsed e
+        startep="$(cat "$ep" 2>/dev/null)"; case "$startep" in ''|*[!0-9]*) startep="$nowe" ;; esac
+        e=$(( nowe - startep )); [ "$e" -lt 0 ] && e=0
+        if [ "$e" -ge 3600 ]; then elapsed="$(( e/3600 ))h$(( (e%3600)/60 ))m"
+        elif [ "$e" -ge 60 ]; then elapsed="$(( e/60 ))m$(( e%60 ))s"; else elapsed="${e}s"; fi
+
+        # cache the expensive bits (real diff + recent verdicts) — only recompute when the iteration ticks
+        if [ "$iter" != "$last_iter" ]; then
+          lastchange="$(git -C "$target" show --stat --oneline HEAD 2>/dev/null | head -3)"
+          recent="$(grep -E 'VERDICT .* (ACCEPTED|REJECTED)' "$prog" 2>/dev/null | tail -3 | sed 's/^:: *//')"
+          if [ -n "$last_iter" ]; then            # a real completion → bell + notification (only on change)
+            printf '\a'
+            command -v osascript >/dev/null 2>&1 && osascript -e "display notification \"iteration $iter done · $class\" with title \"✅ Ralph · $(basename "$target")\" sound name \"Glass\"" >/dev/null 2>&1 &
+          fi
+          last_iter="$iter"; stall_armed=1
+        fi
+        if [ "$stall" = 1 ] && [ "$stall_armed" = 1 ]; then     # STALL → loud alert, once, until it recovers
           printf '\a'
-          command -v osascript >/dev/null 2>&1 && \
-            osascript -e "display notification \"iteration $cur_iter · $cur_class\" with title \"Ralph · $(basename "$target")\" sound name \"Glass\"" >/dev/null 2>&1 &
-          last_iter="$cur_iter"
+          command -v osascript >/dev/null 2>&1 && osascript -e "display notification \"NO progress for ${idle}s on iter $iter — possible stall\" with title \"⚠️ Ralph STALL · $(basename "$target")\" sound name \"Basso\"" >/dev/null 2>&1 &
+          stall_armed=0
         fi
-        if [ "$cur_status" != "$last_status" ] || [ "$cur_stall" = "true" ]; then
-          printf '[%s] ⚠ status: %s (class=%s, stalled=%s)\n' \
-            "$(date '+%H:%M:%S')" "${cur_status:-?}" "${cur_class:-?}" "${cur_stall:-?}"
-          last_status="$cur_status"
-        fi
+        [ "$stall" = 0 ] && stall_armed=1
+
+        # ── draw frame (cursor home; each line cleared to EOL; clear trailing at the end) ──
+        si=$(( (si + 1) % 4 )); local sp="${spin:$si:1}" ph
+        case "$phase" in
+          running_agy) ph="🍳 cooking — agy is working" ;;
+          backoff)     ph="⏳ backing off (will retry)" ;;
+          paused)      ph="⏸  paused" ;;
+          *)           ph="$phase" ;;
+        esac
+        [ "$stall" = 1 ] && ph="⚠️  STALLED? no output for ${idle}s"
+        [ "$aliveword" = dead ] && ph="🔴 daemon not running (start: ralph start)"
+        { printf '\033[H'
+          printf '  🔁 ralph · %s            %s  %s\033[K\n' "$(basename "$target")" "$sp" "$ph"
+          printf '  ──────────────────────────────────────────────────────────────\033[K\n'
+          printf '  iteration : %-6s  running %-8s  status: %s\033[K\n' "${iter:-?}" "$elapsed" "$aliveword"
+          printf '  last class: %-10s  stalled: %-5s  ~tokens: %s est\033[K\n' "${class:-?}" "${stalled:-?}" "${tokc:-0}"
+          printf '\033[K\n'
+          printf '  ▸ doing now: %s\033[K\n' "${act:-…}"
+          printf '\033[K\n'
+          printf '  ▸ last change (real, committed):\033[K\n'
+          if [ -n "$lastchange" ]; then printf '%s\n' "$lastchange" | while IFS= read -r ln; do printf '      %s\033[K\n' "$(printf '%s' "$ln" | cut -c1-66)"; done; else printf '      (none yet)\033[K\n'; fi
+          printf '\033[K\n'
+          printf '  ▸ recent verdicts:\033[K\n'
+          if [ -n "$recent" ]; then printf '%s\n' "$recent" | while IFS= read -r ln; do printf '      %s\033[K\n' "$(printf '%s' "$ln" | cut -c1-66)"; done; else printf '      (warming up…)\033[K\n'; fi
+          printf '\033[K\n'
+          printf '  Ctrl-C to close · the loop keeps running in the background\033[K\n'
+          printf '\033[J'
+        }
+        /usr/bin/perl -e 'select(undef,undef,undef,1)' 2>/dev/null || sleep 1
       done
       ;;
     gui)
