@@ -42,6 +42,28 @@ setup() {
   grep -q 'hello-err' "$LOG"
 }
 
+@test "T-BOUND-idle: a SILENT-but-alive child is reclaimed by the idle watchdog (124) before the wall cap" {
+  # Output once, then go silent far longer than BOUNDED_IDLE_S but well under the 30s wall. The idle
+  # watchdog must group-kill it as a stall (rc 124) within ~idle+grace — this is agy frozen "waiting for
+  # response" recovering in seconds instead of waiting out the whole wall.
+  export BOUNDED_IDLE_S=2
+  start="$(date +%s)"
+  run bounded_run 30 "$LOG" -- /bin/sh -c 'echo working; /usr/bin/perl -e "select(undef,undef,undef,25)"'
+  end="$(date +%s)"
+  unset BOUNDED_IDLE_S
+  [ "$status" -eq 124 ]
+  [ "$((end - start))" -lt 14 ]
+}
+
+@test "T-BOUND-idle-healthy: a child that KEEPS emitting is NOT killed by the idle watchdog" {
+  # Emits a line ~every second for ~5s then exits 0. With BOUNDED_IDLE_S=3 the log keeps growing, so the
+  # idle watchdog must NEVER fire — bounded_run returns the child's real rc 0 (no false stall-kill).
+  export BOUNDED_IDLE_S=3
+  run bounded_run 30 "$LOG" -- /bin/sh -c 'for i in 1 2 3 4 5; do echo tick $i; /usr/bin/perl -e "select(undef,undef,undef,1)"; done; exit 0'
+  unset BOUNDED_IDLE_S
+  [ "$status" -eq 0 ]
+}
+
 @test "T-BOUND-no-orphan: the whole process group is reaped (hung grandchild dies)" {
   # A child that spawns a long-lived grandchild then itself hangs. The group-kill
   # watchdog must reap BOTH. We tag the grandchild so we can grep for survivors.
