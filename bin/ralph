@@ -675,6 +675,43 @@ cmd_tail() {
   exec tail -f "$sup"
 }
 
+# ── say / chat — dictate a LIVE message to the running loop WITHOUT stopping it ───────────────────
+# The message lands in <target>/.ralph/INBOX.md; render_prompt injects it into the NEXT iteration's
+# prompt as an OPERATOR DIRECTIVE and archives it (delivered once). The daemon keeps iterating — this is
+# a pure side-channel, like jotting a note to the agent between turns.
+_say_resolve() {  # echo the target; if $1 is an initialized repo dir use it, else the default target
+  if [ -n "${1:-}" ] && [ -d "$1/.ralph" ]; then ( cd "$1" >/dev/null 2>&1 && pwd ); return 0; fi
+  resolve_target ""
+}
+cmd_say() {
+  local target; target="$(_say_resolve "${1:-}")" || exit 1
+  [ -n "${1:-}" ] && [ -d "${1:-}/.ralph" ] && shift
+  require_initialized "$target"
+  local msg="$*"
+  if [ -z "$msg" ]; then printf 'message> ' >&2; IFS= read -r msg || true; fi
+  [ -n "$msg" ] || { echo "ralph say: empty message (usage: ralph say [target] <text>)" >&2; exit 1; }
+  printf -- '- [%s] %s\n' "$(date '+%Y-%m-%d %H:%M')" "$msg" >> "$target/.ralph/INBOX.md"
+  printf 'ralph: ✓ queued for the next iteration (loop still running) → %s\n' "$msg"
+}
+cmd_chat() {
+  local target; target="$(_say_resolve "${1:-}")" || exit 1
+  [ -n "${1:-}" ] && [ -d "${1:-}/.ralph" ] && shift
+  require_initialized "$target"
+  local name; name="$(basename "$target")"
+  printf '💬 ralph chat → %s\n' "$name"
+  printf '   Type a directive + Enter to dictate it to the running loop (it NEVER stops).\n'
+  printf '   Examples: "focus on api.py next"  ·  "stop adding tests, fix the lint errors"  ·  "prioritize security"\n'
+  printf '   Empty line or Ctrl-D to exit.\n\n'
+  local line n=0
+  while printf '%s ▸ ' "$name" && IFS= read -r line; do
+    [ -z "$line" ] && break
+    printf -- '- [%s] %s\n' "$(date '+%Y-%m-%d %H:%M')" "$line" >> "$target/.ralph/INBOX.md"
+    n=$(( n + 1 ))
+    printf '   ✓ queued (#%d) — the loop will act on it next iteration\n' "$n"
+  done
+  printf '\nbye — queued %d message(s); the loop kept running the whole time.\n' "$n"
+}
+
 # ── quota — read the LIVE Antigravity model quota over the running IDE's DevTools/CDP port ─────────
 # The IDE fetches the Models-panel quota (refresh time + AI credits) and renders it; it is NOT persisted
 # to any file. We scrape the SAME rendered text via Chrome DevTools Protocol so the dashboard matches the
@@ -845,19 +882,26 @@ cmd_watch() {
         # QUOTA REFRESH: PREFER the LIVE value scraped from the running IDE's Models panel over CDP (so it
         # matches the app EXACTLY); a background probe refreshes a cache every ~60s. Fall back to a local
         # ~Wh estimate (anchor = today 00:00) only when the app/CDP/panel is unavailable.
-        local now_e a ws reset_e qlive=0 reset_live="" credits="" _d
+        local now_e a ws reset_e qlive=0 reset_live="" credits="" _d qage=999999
         now_e="$(date +%s)"
         prb_tick=$(( prb_tick + 1 ))
         if [ "$prb_tick" -ge 60 ]; then
           ( "$self" quota >"$qcache.tmp" 2>/dev/null && mv -f "$qcache.tmp" "$qcache" 2>/dev/null ) &
           prb_tick=0
         fi
-        if [ -f "$qcache" ] && [ "$(( now_e - $(stat -f%m "$qcache" 2>/dev/null || echo 0) ))" -lt 200 ]; then
+        if [ -f "$qcache" ]; then
+          qage=$(( now_e - $(stat -f%m "$qcache" 2>/dev/null || echo 0) ))
           reset_live="$(sed -n 's/.*RESET_EPOCH=\([0-9]*\).*/\1/p' "$qcache" 2>/dev/null)"
           credits="$(sed -n 's/.*CREDITS=\([0-9]*\).*/\1/p' "$qcache" 2>/dev/null)"
-          if [ -n "$reset_live" ] && [ "$reset_live" -gt "$now_e" ] 2>/dev/null; then reset_e="$reset_live"; qlive=1; fi
         fi
-        if [ "$qlive" = 0 ]; then
+        # The app's RESET_EPOCH is an ABSOLUTE time, so keep counting down to it even if the probe hasn't
+        # refreshed lately (e.g. the Models panel got closed) — no stale fallback. If it already passed (a
+        # refresh happened), roll forward by the window. Only with NO cache at all do we use a local guess.
+        if [ -n "$reset_live" ] && [ "$qage" -lt 21600 ] 2>/dev/null; then
+          reset_e="$reset_live"
+          while [ "$reset_e" -le "$now_e" ] 2>/dev/null; do reset_e=$(( reset_e + win )); done
+          qlive=1
+        else
           a="$uanchor"; [ -z "$a" ] && a="$(date -v0H -v0M -v0S +%s 2>/dev/null || echo "$now_e")"
           _d=$(( now_e - a )); [ "$_d" -lt 0 ] && _d=0
           reset_e=$(( a + ( ( _d / win ) + 1 ) * win ))   # next ~Wh boundary
@@ -918,13 +962,17 @@ cmd_watch() {
           rh=$(( rin / 3600 )); rm=$(( (rin % 3600) / 60 ))
           rclk="$(date -r "$reset_e" +%H:%M 2>/dev/null || echo '??:??')"
           cyclepct=$(( rin * 100 / win )); [ "$cyclepct" -gt 100 ] && cyclepct=100; [ "$cyclepct" -lt 0 ] && cyclepct=0
-          if [ "$qlive" = 1 ]; then qsrc="● live (from app)"; else qsrc="○ est · open app Models for live"; fi
+          if [ "$qlive" = 1 ]; then
+            if [ "${qage:-0}" -lt 120 ] 2>/dev/null; then qsrc="● live (from app)"; else qsrc="● live · synced $(( qage / 60 ))m ago"; fi
+          else qsrc="○ est · open app's Models panel for live"; fi
           printf '  quota cycle: %s  refreshes %s (in %dh %02dm)  %s\033[K\n' "$(bar "$cyclepct" 18)" "$rclk" "$rh" "$rm" "$qsrc"
           if [ "$qlive" = 1 ] && [ -n "$credits" ]; then
             printf '  AI credits : %s   ·   used (est): ~%s tok this cycle\033[K\n' "$credits" "$(hnum "$tok")"
           else
             printf '  used (est) : ~%s tok this cycle\033[K\n' "$(hnum "$tok")"
           fi
+          local inbox_n=0; [ -s "$target/.ralph/INBOX.md" ] && inbox_n="$(grep -c '^-' "$target/.ralph/INBOX.md" 2>/dev/null || echo 0)"
+          [ "${inbox_n:-0}" -gt 0 ] 2>/dev/null && printf '  📨 inbox    : %s message(s) queued for the next iteration (ralph chat to add)\033[K\n' "$inbox_n"
           printf '\033[K\n'
           printf '  ▸ doing now: %s\033[K\n' "${act:-…}"
           printf '\033[K\n'
@@ -1218,6 +1266,10 @@ COMMANDS
                      Open a LIVE monitor window (status + per-iteration PROGRESS journal). Default pops
                      a Terminal window; --here runs inline; --journal streams PROGRESS.md; --log the engine log.
   tail [target] [--iter N]   tail -f the supervisor log (or one iteration).
+  say [target] <text>   Queue a LIVE directive to the running loop (.ralph/INBOX.md); it is injected
+                     into the NEXT iteration's prompt as an operator directive. The loop never stops.
+  chat [target]      Interactive side-channel: type directives, each queued to the running loop.
+  quota [target]     Print the LIVE model quota (refresh time + AI credits) read from the IDE over CDP.
   pause [target]     touch .ralph/PAUSE (idles, keeps heartbeating). exit 2.
   resume [target]    rm .ralph/PAUSE.
   stop [target] [--hard] [--permanent]
@@ -1257,6 +1309,8 @@ main() {
     status)          cmd_status "$@" ;;
     watch)           cmd_watch "$@" ;;
     quota)           cmd_quota "$@" ;;
+    say)             cmd_say "$@" ;;
+    chat)            cmd_chat "$@" ;;
     tail)            cmd_tail "$@" ;;
     pause)           cmd_pause "$@" ;;
     resume)          cmd_resume "$@" ;;

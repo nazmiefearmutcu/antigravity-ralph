@@ -235,6 +235,17 @@ render_prompt() {
   regression_notice="$(_pf_regression_notice "$ralph/RATCHET.json" "$head_sha")"
   integrity_notice="$(_pf_integrity_notice "$ralph/RATCHET.json" "$ralph/state.json")"
 
+  # ── OPERATOR INBOX (live side-channel) — pending human directives queued via `ralph say` / `ralph chat`
+  #    while the loop keeps running. Read them, then ARCHIVE + clear so each is delivered to the agent
+  #    exactly once and steers THIS iteration only. The loop is never stopped to receive them. ──
+  local operator_inbox=""
+  if [ -s "$ralph/INBOX.md" ]; then
+    operator_inbox="$(cat "$ralph/INBOX.md" 2>/dev/null)"
+    { printf '\n=== consumed @ iter %s (%s) ===\n' "$iter" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; cat "$ralph/INBOX.md"; } >> "$ralph/INBOX.archive" 2>/dev/null || true
+    : > "$ralph/INBOX.md" 2>/dev/null || true
+  fi
+  [ -n "$operator_inbox" ] || operator_inbox="(none — no pending operator messages)"
+
   # ── substitute every {{...}} placeholder via perl, values passed as env vars
   #    (so file bodies are treated as opaque literals — no regex escaping). ──
   RP_ITER="$iter" \
@@ -251,6 +262,7 @@ render_prompt() {
   RP_REGRESSION_NOTICE="$regression_notice" \
   RP_INTEGRITY_NOTICE="$integrity_notice" \
   RP_ALLOW_TXT="$allow_txt" \
+  RP_OPERATOR_INBOX="$operator_inbox" \
   /usr/bin/perl -0777 -pe '
     my %map = (
       "ITER"               => $ENV{RP_ITER},
@@ -267,6 +279,7 @@ render_prompt() {
       "REGRESSION_NOTICE"  => $ENV{RP_REGRESSION_NOTICE},
       "INTEGRITY_NOTICE"   => $ENV{RP_INTEGRITY_NOTICE},
       "ALLOW_TXT"          => $ENV{RP_ALLOW_TXT},
+      "OPERATOR_INBOX"     => $ENV{RP_OPERATOR_INBOX},
     );
     # Replace {{KEY}} for each known key; unknown placeholders are left intact.
     s/\{\{([A-Z_]+)\}\}/ exists $map{$1} ? (defined $map{$1} ? $map{$1} : "") : "{{$1}}" /ge;
