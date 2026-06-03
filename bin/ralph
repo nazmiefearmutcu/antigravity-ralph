@@ -374,8 +374,9 @@ this, each command FOREGROUND and returning immediately (never background-poll):
 1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
 2. ralph start "$PWD" --daemon                  # start the never-stopping daemon (idempotent)
 3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
-4. tail -n 20 "$PWD/.ralph/PROGRESS.md" 2>/dev/null || true   # show it's making progress
-Then tell the user it is running forever and how to watch (`ralph status "$PWD"`) and stop
+Then tell the user it is running forever in the BACKGROUND (that is what makes it never-stop +
+stall-proof) and how to FOLLOW IT LIVE from the IDE terminal — `ralph status "$PWD" --watch` (live
+dashboard, refreshes every 2s) or `ralph tail "$PWD"` (streams every iteration) — plus how to stop
 (`ralph stop "$PWD"`). You are DONE — the daemon owns the loop and survives this chat closing; do not
 iterate/poll/summarize here. If status shows NOT alive (sandbox blocked the launch), tell the user to
 run `ralph start "$PWD" --daemon` once in a plain terminal.
