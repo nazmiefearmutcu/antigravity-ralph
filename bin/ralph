@@ -730,6 +730,10 @@ cmd_watch() {
       limit="${RALPH_USAGE_LIMIT:-}"
       [ -z "$limit" ] && [ -f "$target/.ralph/config.env" ] && limit="$(sed -n 's/^[[:space:]]*RALPH_USAGE_LIMIT=//p' "$target/.ralph/config.env" 2>/dev/null | tr -d '"' | head -1)"
       case "$limit" in ''|*[!0-9]*) limit=8000000 ;; esac     # default est budget; override with RALPH_USAGE_LIMIT
+      # Antigravity refreshes a usage budget on a ROLLING ~5h window (the real metric is opaque "units"
+      # — 250/5h + 2800/week — not tokens; we estimate tokens in the CURRENT window only). Configurable:
+      local win uanchor; win="${RALPH_USAGE_WINDOW_S:-18000}"; case "$win" in ''|*[!0-9]*) win=18000 ;; esac
+      uanchor="${RALPH_USAGE_ANCHOR:-}"; case "$uanchor" in *[!0-9]*) uanchor="" ;; esac   # epoch; default = today 00:00 local
       bar() { local p="$1" w="${2:-20}" f i o=""; case "$p" in ''|*[!0-9]*) p=0 ;; esac; [ "$p" -gt 100 ] && p=100; [ "$p" -lt 0 ] && p=0; f=$(( p * w / 100 )); i=0; while [ "$i" -lt "$f" ]; do o="${o}█"; i=$(( i+1 )); done; while [ "$i" -lt "$w" ]; do o="${o}░"; i=$(( i+1 )); done; printf '%s' "$o"; }
       hnum() { local n="$1"; case "$n" in ''|*[!0-9]*) n=0 ;; esac; if [ "$n" -ge 1000000 ]; then awk -v x="$n" 'BEGIN{printf "%.2fM", x/1000000}'; elif [ "$n" -ge 1000 ]; then awk -v x="$n" 'BEGIN{printf "%.1fk", x/1000}'; else printf '%s' "$n"; fi; }
       printf '\033[2J\033[?25l'                     # one initial clear + hide cursor
@@ -766,10 +770,17 @@ cmd_watch() {
         local stall=0
         { [ "$stalled" = "true" ] || { [ "$phase" = "running_agy" ] && [ "$idle" -ge 240 ]; }; } && stall=1
 
-        # token estimate (sum of prompt.txt + agy.stdout sizes /4) — refreshed every ~5 ticks
+        # 5-HOUR WINDOW: count only THIS window's estimated tokens (iter dirs touched since the window
+        # start), not cumulative-since-forever — the budget refreshes every ~5h, so usage must too.
+        local now_e a ws reset_e
+        now_e="$(date +%s)"
+        a="$uanchor"; [ -z "$a" ] && a="$(date -v0H -v0M -v0S +%s 2>/dev/null || echo "$now_e")"
+        local _d=$(( now_e - a )); [ "$_d" -lt 0 ] && _d=0
+        ws=$(( a + ( _d / win ) * win ))      # start of the current 5h block
+        reset_e=$(( ws + win ))               # when this window refreshes
         tok_tick=$(( tok_tick + 1 ))
         if [ "$tok_tick" -ge 5 ]; then
-          tok="$(find "$target"/.ralph/iter \( -name prompt.txt -o -name agy.stdout \) -print0 2>/dev/null | xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END{print int(s/4)}')"
+          tok="$(find "$target"/.ralph/iter \( -name prompt.txt -o -name agy.stdout \) -print0 2>/dev/null | xargs -0 stat -f '%m %z' 2>/dev/null | awk -v ws="$ws" '$1>=ws{s+=$2} END{print int(s/4)}')"
           [ -z "$tok" ] && tok=0
           tok_tick=0
         fi
@@ -814,11 +825,16 @@ cmd_watch() {
           printf '  ──────────────────────────────────────────────────────────────\033[K\n'
           printf '  iteration : %-6s  running %-8s  status: %s\033[K\n' "${iter:-?}" "$elapsed" "$aliveword"
           printf '  last class: %-10s  stalled: %-5s\033[K\n' "${class:-?}" "${stalled:-?}"
-          printf '  model     : %s\033[K\n' "$model"
-          local usedpct rempct
+          printf '  model      : %s\033[K\n' "$model"
+          local usedpct rempct rin rh rm rclk
           usedpct=$(( tok * 100 / limit )); [ "$usedpct" -gt 100 ] && usedpct=100
           rempct=$(( 100 - usedpct ))
-          printf '  kalan limit: %s %3s%%   (%s / %s)\033[K\n' "$(bar "$rempct" 28)" "$rempct" "$(hnum "$tok")" "$(hnum "$limit")"
+          rin=$(( reset_e - now_e )); [ "$rin" -lt 0 ] && rin=0
+          rh=$(( rin / 3600 )); rm=$(( (rin % 3600) / 60 ))
+          rclk="$(date -r "$reset_e" +%H:%M 2>/dev/null || echo '??:??')"
+          printf '  kalan limit: %s %3s%%   (bu 5s pencere · tahmini)\033[K\n' "$(bar "$rempct" 24)" "$rempct"
+          printf '  kullanılan : ~%s / %s tok   (yalnız bu pencerede)\033[K\n' "$(hnum "$tok")" "$(hnum "$limit")"
+          printf '  yenilenme  : %s  (%ds %02ddk sonra sıfırlanır)\033[K\n' "$rclk" "$rh" "$rm"
           printf '\033[K\n'
           printf '  ▸ doing now: %s\033[K\n' "${act:-…}"
           printf '\033[K\n'
