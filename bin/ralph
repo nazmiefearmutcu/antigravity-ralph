@@ -675,6 +675,78 @@ cmd_tail() {
   exec tail -f "$sup"
 }
 
+# ── quota — read the LIVE Antigravity model quota over the running IDE's DevTools/CDP port ─────────
+# The IDE fetches the Models-panel quota (refresh time + AI credits) and renders it; it is NOT persisted
+# to any file. We scrape the SAME rendered text via Chrome DevTools Protocol so the dashboard matches the
+# app EXACTLY. Best-effort: prints "RESET_EPOCH=<n> REFRESH_S=<n> CREDITS=<n>" on success, nothing if the
+# app/CDP/Models-panel is unavailable. Needs python3 + the websockets module + the IDE running.
+cmd_quota() {
+  local model="${RALPH_MODEL:-$(sed -n 's/.*"model"[: ]*"\([^"]*\)".*/\1/p' "$HOME/.gemini/antigravity-cli/settings.json" 2>/dev/null | head -1)}"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$model" 2>/dev/null <<'PY'
+import sys, json, os, re, time, urllib.request
+try:
+    import websockets, asyncio
+except Exception:
+    sys.exit(1)
+model = sys.argv[1] if len(sys.argv) > 1 else ""
+appdir = os.path.expanduser("~/Library/Application Support/Antigravity")
+try:
+    port = open(os.path.join(appdir, "DevToolsActivePort")).readline().strip()
+except Exception:
+    sys.exit(1)
+def find_ws():
+    d = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2))
+    for t in d:
+        if t.get("type") == "page" and "antigravity" in (t.get("title", "") + t.get("url", "")).lower():
+            return t["webSocketDebuggerUrl"]
+    return None
+def parse_ref(s):
+    m = re.search(r"Refreshes in\s*(?:(\d+)\s*hours?)?[, ]*(?:(\d+)\s*minutes?)?", s)
+    if m and (m.group(1) or m.group(2)):
+        return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
+    return None
+async def run():
+    u = find_ws()
+    if not u:
+        return
+    async with websockets.connect(u, max_size=None, open_timeout=3, close_timeout=2) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                  "params": {"expression": "document.body.innerText", "returnByValue": True}}))
+        for _ in range(60):
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+            if m.get("id") == 1:
+                txt = (m.get("result", {}).get("result", {}) or {}).get("value", "") or ""
+                lines = [l.strip() for l in txt.splitlines() if l.strip()]
+                cred = ""
+                for l in lines:
+                    mm = re.search(r"Available AI Credits:\s*([\d,]+)", l)
+                    if mm:
+                        cred = mm.group(1).replace(",", "")
+                rs = None
+                for i, l in enumerate(lines):
+                    if l == model and i + 1 < len(lines):
+                        rs = parse_ref(lines[i + 1])
+                        if rs is not None:
+                            break
+                if rs is None:
+                    for i, l in enumerate(lines):
+                        if "Gemini 3.5 Flash" in l and i + 1 < len(lines):
+                            rs = parse_ref(lines[i + 1])
+                            if rs is not None:
+                                break
+                out = []
+                if rs is not None:
+                    out += [f"RESET_EPOCH={int(time.time()) + rs}", f"REFRESH_S={rs}"]
+                if cred:
+                    out.append(f"CREDITS={cred}")
+                if out:
+                    print(" ".join(out))
+                return
+asyncio.run(run())
+PY
+}
+
 # ── watch — a LIVE window into the background daemon: status + WHAT IT DID each iteration ──────────
 # The loop runs headless in the daemon; `ralph watch <target>` is the user's live window into it. It
 # pops a new Terminal.app window (so it shows up as its own tab/window) running a refreshing panel of
@@ -719,7 +791,7 @@ cmd_watch() {
       local st="$target/.ralph/state.json" hb="$target/.ralph/heartbeat.json" ep="$target/.ralph/last_run_started.epoch"
       local spin='|/-\' si=0
       local last_iter="" lastchange="" recent="" tok="0" tok_tick=99
-      local last_size="-1" last_grow=0 stall_armed=1
+      local last_size="-1" last_grow=0 stall_armed=1 prb_tick=999 qcache="$target/.ralph/quota.live"
       # Model is REAL (Antigravity settings.json). The usage LIMIT is a CONFIGURABLE budget: Antigravity
       # does not expose the live quota in any local file (its own usage-metrics backend even fails), so set
       # RALPH_USAGE_LIMIT (env or .ralph/config.env) to your plan's cap for an accurate %. Tokens are an
@@ -770,14 +842,27 @@ cmd_watch() {
         local stall=0
         { [ "$stalled" = "true" ] || { [ "$phase" = "running_agy" ] && [ "$idle" -ge 240 ]; }; } && stall=1
 
-        # 5-HOUR WINDOW: count only THIS window's estimated tokens (iter dirs touched since the window
-        # start), not cumulative-since-forever — the budget refreshes every ~5h, so usage must too.
-        local now_e a ws reset_e
+        # QUOTA REFRESH: PREFER the LIVE value scraped from the running IDE's Models panel over CDP (so it
+        # matches the app EXACTLY); a background probe refreshes a cache every ~60s. Fall back to a local
+        # ~Wh estimate (anchor = today 00:00) only when the app/CDP/panel is unavailable.
+        local now_e a ws reset_e qlive=0 reset_live="" credits="" _d
         now_e="$(date +%s)"
-        a="$uanchor"; [ -z "$a" ] && a="$(date -v0H -v0M -v0S +%s 2>/dev/null || echo "$now_e")"
-        local _d=$(( now_e - a )); [ "$_d" -lt 0 ] && _d=0
-        ws=$(( a + ( _d / win ) * win ))      # start of the current 5h block
-        reset_e=$(( ws + win ))               # when this window refreshes
+        prb_tick=$(( prb_tick + 1 ))
+        if [ "$prb_tick" -ge 60 ]; then
+          ( "$self" quota >"$qcache.tmp" 2>/dev/null && mv -f "$qcache.tmp" "$qcache" 2>/dev/null ) &
+          prb_tick=0
+        fi
+        if [ -f "$qcache" ] && [ "$(( now_e - $(stat -f%m "$qcache" 2>/dev/null || echo 0) ))" -lt 200 ]; then
+          reset_live="$(sed -n 's/.*RESET_EPOCH=\([0-9]*\).*/\1/p' "$qcache" 2>/dev/null)"
+          credits="$(sed -n 's/.*CREDITS=\([0-9]*\).*/\1/p' "$qcache" 2>/dev/null)"
+          if [ -n "$reset_live" ] && [ "$reset_live" -gt "$now_e" ] 2>/dev/null; then reset_e="$reset_live"; qlive=1; fi
+        fi
+        if [ "$qlive" = 0 ]; then
+          a="$uanchor"; [ -z "$a" ] && a="$(date -v0H -v0M -v0S +%s 2>/dev/null || echo "$now_e")"
+          _d=$(( now_e - a )); [ "$_d" -lt 0 ] && _d=0
+          reset_e=$(( a + ( ( _d / win ) + 1 ) * win ))   # next ~Wh boundary
+        fi
+        ws=$(( reset_e - win ))                            # window start (for usage counting)
         tok_tick=$(( tok_tick + 1 ))
         if [ "$tok_tick" -ge 5 ]; then
           tok="$(find "$target"/.ralph/iter \( -name prompt.txt -o -name agy.stdout \) -print0 2>/dev/null | xargs -0 stat -f '%m %z' 2>/dev/null | awk -v ws="$ws" '$1>=ws{s+=$2} END{print int(s/4)}')"
@@ -826,18 +911,20 @@ cmd_watch() {
           printf '  iteration : %-6s  running %-8s  status: %s\033[K\n' "${iter:-?}" "$elapsed" "$aliveword"
           printf '  last class: %-10s  stalled: %-5s\033[K\n' "${class:-?}" "${stalled:-?}"
           printf '  model      : %s\033[K\n' "$model"
-          # NOTE: Antigravity's live per-model quota (the green bars + exact "Refreshes in …") is fetched
-          # on demand by the IDE and is NOT persisted to any local file, so it cannot be read from here.
-          # What we CAN show accurately is the refresh-CYCLE clock (a time bar — we know the wall clock):
-          # how far the current ~3h Gemini-Flash window has to go before the quota refreshes. The token
-          # figure is a rough local estimate only — for the real remaining quota open the app's Models panel.
-          local rin rh rm rclk cyclepct
+          # The refresh time + AI credits are read LIVE from the running IDE's Models panel over CDP (so
+          # they match the app exactly); when the app/panel is unavailable we show a local ~Wh estimate.
+          local rin rh rm rclk cyclepct qsrc
           rin=$(( reset_e - now_e )); [ "$rin" -lt 0 ] && rin=0
           rh=$(( rin / 3600 )); rm=$(( (rin % 3600) / 60 ))
           rclk="$(date -r "$reset_e" +%H:%M 2>/dev/null || echo '??:??')"
           cyclepct=$(( rin * 100 / win )); [ "$cyclepct" -gt 100 ] && cyclepct=100; [ "$cyclepct" -lt 0 ] && cyclepct=0
-          printf '  quota cycle: %s  refreshes %s (in %dh %02dm)\033[K\n' "$(bar "$cyclepct" 20)" "$rclk" "$rh" "$rm"
-          printf '  used (est) : ~%s tok this cycle   ·  real quota: Antigravity > Settings > Models\033[K\n' "$(hnum "$tok")"
+          if [ "$qlive" = 1 ]; then qsrc="● live (from app)"; else qsrc="○ est · open app Models for live"; fi
+          printf '  quota cycle: %s  refreshes %s (in %dh %02dm)  %s\033[K\n' "$(bar "$cyclepct" 18)" "$rclk" "$rh" "$rm" "$qsrc"
+          if [ "$qlive" = 1 ] && [ -n "$credits" ]; then
+            printf '  AI credits : %s   ·   used (est): ~%s tok this cycle\033[K\n' "$credits" "$(hnum "$tok")"
+          else
+            printf '  used (est) : ~%s tok this cycle\033[K\n' "$(hnum "$tok")"
+          fi
           printf '\033[K\n'
           printf '  ▸ doing now: %s\033[K\n' "${act:-…}"
           printf '\033[K\n'
@@ -1169,6 +1256,7 @@ main() {
     once)            cmd_once "$@" ;;
     status)          cmd_status "$@" ;;
     watch)           cmd_watch "$@" ;;
+    quota)           cmd_quota "$@" ;;
     tail)            cmd_tail "$@" ;;
     pause)           cmd_pause "$@" ;;
     resume)          cmd_resume "$@" ;;
