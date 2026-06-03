@@ -88,14 +88,19 @@ The same loop is reachable three ways; all share the safety model:
    into `~/.claude/commands/`. It teaches Claude Code to operate the loop (doctor → init → start →
    monitor) and never pause to ask "should I continue?".
 
-3. **Antigravity in-IDE** — two pieces:
-   - [`integrations/antigravity/never-stop-ralph.md`](integrations/antigravity/never-stop-ralph.md)
-     → `~/.gemini/antigravity/global_workflows/`: a `/ralph` workflow that runs the Ralph discipline
-     interactively in the IDE (read disk state → one strictly-better unit → verify → append PROGRESS
-     → never summarize).
-   - [`integrations/antigravity/GEMINI.snippet.md`](integrations/antigravity/GEMINI.snippet.md)
-     → appended to `~/.gemini/GEMINI.md`: a global rule that makes any agent in a `.ralph/` workspace
-     behave as one iteration of the never-stop loop.
+3. **`/ralphloop` inside Antigravity (`agy` CLI + IDE chat)** — the slash command. Two scopes:
+   - **Global (every `agy` session, any dir)** — install the skill:
+     `cp -r integrations/antigravity/skill/ralphloop ~/.gemini/antigravity-cli/skills/`
+     Antigravity auto-imports markdown skills from `~/.gemini/antigravity-cli/skills/` at each `agy`
+     launch (no IDE restart needed), so `/ralphloop` is available everywhere. Verify with `/skills`.
+   - **Per-repo** — `ralph init` drops [`integrations/antigravity/workflow/ralphloop.md`](integrations/antigravity/workflow/ralphloop.md)
+     at `<repo>/.agent/workflows/ralphloop.md`; Antigravity reads workspace workflows there and the
+     slash name is the filename → `/ralphloop` in that repo.
+   - Also: [`integrations/antigravity/GEMINI.snippet.md`](integrations/antigravity/GEMINI.snippet.md)
+     → appended to `~/.gemini/GEMINI.md` makes any agent in a `.ralph/` workspace behave as one
+     iteration of the loop even without the slash command.
+   > Note: `~/.gemini/antigravity/global_workflows/` is **not** read by the `agy` CLI menu — use the
+   > skills dir (global) or `.agent/workflows/` (per-repo) above.
 
 ---
 

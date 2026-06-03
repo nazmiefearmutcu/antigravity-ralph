@@ -358,6 +358,25 @@ MISSION
   [ -f "$target/.ralph/.canonical/MISSION.md" ] || \
     cp "$target/.ralph/MISSION.md" "$target/.ralph/.canonical/MISSION.md" 2>/dev/null || true
 
+  # ── per-repo Antigravity workflow → makes /ralphloop available in agy when launched in this repo
+  #    (Antigravity reads workspace workflows from <repo>/.agent/workflows/<name>.md; the slash command
+  #    name is the filename). The GLOBAL equivalent is the skill at ~/.gemini/antigravity-cli/skills/. ──
+  mkdir -p "$target/.agent/workflows" 2>/dev/null || true
+  if [ ! -f "$target/.agent/workflows/ralphloop.md" ]; then
+    cat > "$target/.agent/workflows/ralphloop.md" <<'WF'
+---
+description: Never-stop Ralph loop on THIS repo — one strictly-better VERIFIED unit per turn, state externalized to .ralph/. For unattended/forever runs use `ralph start "$PWD" --daemon`.
+---
+# /ralphloop
+Until the user says stop, repeat: read .ralph/{MISSION,HANDOFF,LEDGER,RATCHET}.* first; pick ONE unit
+that makes the repo STRICTLY BETTER than HEAD (real fix → coverage → hardening → docs); implement it;
+VERIFY for real; append to .ralph/PROGRESS.md + update .ralph/LEDGER.md; commit only if strictly-better
+and verified; never stop to summarize — go again. Headless engine: `ralph start "$PWD" --daemon`.
+Hard limits: no financial actions; no broad `rm -rf`; no force-push to main; no DB drop; no push to a
+remote the user doesn't own.
+WF
+  fi
+
   # ── seed the work-memory files (append-only; created empty-but-valid) ──
   [ -f "$target/.ralph/PROGRESS.md" ] || printf '# PROGRESS (append-only journal)\n' > "$target/.ralph/PROGRESS.md"
   if [ ! -f "$target/.ralph/LEDGER.md" ]; then
