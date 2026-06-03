@@ -732,7 +732,7 @@ cmd_watch() {
       case "$limit" in ''|*[!0-9]*) limit=8000000 ;; esac     # default est budget; override with RALPH_USAGE_LIMIT
       # Antigravity refreshes a usage budget on a ROLLING ~5h window (the real metric is opaque "units"
       # — 250/5h + 2800/week — not tokens; we estimate tokens in the CURRENT window only). Configurable:
-      local win uanchor; win="${RALPH_USAGE_WINDOW_S:-18000}"; case "$win" in ''|*[!0-9]*) win=18000 ;; esac
+      local win uanchor; win="${RALPH_USAGE_WINDOW_S:-10800}"; case "$win" in ''|*[!0-9]*) win=10800 ;; esac   # Gemini Flash refreshes ~3h (per the app); Claude/GPT ~5h
       uanchor="${RALPH_USAGE_ANCHOR:-}"; case "$uanchor" in *[!0-9]*) uanchor="" ;; esac   # epoch; default = today 00:00 local
       bar() { local p="$1" w="${2:-20}" f i o=""; case "$p" in ''|*[!0-9]*) p=0 ;; esac; [ "$p" -gt 100 ] && p=100; [ "$p" -lt 0 ] && p=0; f=$(( p * w / 100 )); i=0; while [ "$i" -lt "$f" ]; do o="${o}█"; i=$(( i+1 )); done; while [ "$i" -lt "$w" ]; do o="${o}░"; i=$(( i+1 )); done; printf '%s' "$o"; }
       hnum() { local n="$1"; case "$n" in ''|*[!0-9]*) n=0 ;; esac; if [ "$n" -ge 1000000 ]; then awk -v x="$n" 'BEGIN{printf "%.2fM", x/1000000}'; elif [ "$n" -ge 1000 ]; then awk -v x="$n" 'BEGIN{printf "%.1fk", x/1000}'; else printf '%s' "$n"; fi; }
@@ -826,15 +826,18 @@ cmd_watch() {
           printf '  iteration : %-6s  running %-8s  status: %s\033[K\n' "${iter:-?}" "$elapsed" "$aliveword"
           printf '  last class: %-10s  stalled: %-5s\033[K\n' "${class:-?}" "${stalled:-?}"
           printf '  model      : %s\033[K\n' "$model"
-          local usedpct rempct rin rh rm rclk
-          usedpct=$(( tok * 100 / limit )); [ "$usedpct" -gt 100 ] && usedpct=100
-          rempct=$(( 100 - usedpct ))
+          # NOTE: Antigravity's live per-model quota (the green bars + exact "Refreshes in …") is fetched
+          # on demand by the IDE and is NOT persisted to any local file, so it cannot be read from here.
+          # What we CAN show accurately is the refresh-CYCLE clock (a time bar — we know the wall clock):
+          # how far the current ~3h Gemini-Flash window has to go before the quota refreshes. The token
+          # figure is a rough local estimate only — for the real remaining quota open the app's Models panel.
+          local rin rh rm rclk cyclepct
           rin=$(( reset_e - now_e )); [ "$rin" -lt 0 ] && rin=0
           rh=$(( rin / 3600 )); rm=$(( (rin % 3600) / 60 ))
           rclk="$(date -r "$reset_e" +%H:%M 2>/dev/null || echo '??:??')"
-          printf '  kalan limit: %s %3s%%   (bu 5s pencere · tahmini)\033[K\n' "$(bar "$rempct" 24)" "$rempct"
-          printf '  kullanılan : ~%s / %s tok   (yalnız bu pencerede)\033[K\n' "$(hnum "$tok")" "$(hnum "$limit")"
-          printf '  yenilenme  : %s  (%ds %02ddk sonra sıfırlanır)\033[K\n' "$rclk" "$rh" "$rm"
+          cyclepct=$(( rin * 100 / win )); [ "$cyclepct" -gt 100 ] && cyclepct=100; [ "$cyclepct" -lt 0 ] && cyclepct=0
+          printf '  quota cycle: %s  refreshes %s (in %dh %02dm)\033[K\n' "$(bar "$cyclepct" 20)" "$rclk" "$rh" "$rm"
+          printf '  used (est) : ~%s tok this cycle   ·  real quota: Antigravity > Settings > Models\033[K\n' "$(hnum "$tok")"
           printf '\033[K\n'
           printf '  ▸ doing now: %s\033[K\n' "${act:-…}"
           printf '\033[K\n'
