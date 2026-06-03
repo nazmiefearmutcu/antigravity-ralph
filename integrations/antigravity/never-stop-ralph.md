@@ -12,14 +12,14 @@ Do EXACTLY this, in order. Each command runs in the FOREGROUND and returns immed
 1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
 2. ralph start "$PWD" --daemon                  # start the never-stopping background daemon (idempotent)
 3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
-4. ralph watch "$PWD"                            # OPEN a live monitor WINDOW (status + per-iteration journal); returns immediately
+4. ralph console "$PWD"                            # OPEN a live monitor WINDOW (status + per-iteration journal); returns immediately
 
 Then tell the user EXACTLY this:
   "✅ Never-stop Ralph engine is running in the background (pid + iteration above), and a LIVE monitor
    window just opened — it shows the status AND what it did each iteration (Task/Changes/Verification/
    Decision from .ralph/PROGRESS.md), refreshing live. It keeps improving this repo FOREVER and
    auto-recovers from any agy stall/timeout.
-     • If the window didn't open, run in a terminal:  ralph watch \"$PWD\"
+     • If the window didn't open, run in a terminal:  ralph console \"$PWD\"
      • Raw engine log stream:                          ralph tail \"$PWD\"
      • STOP it any time:  type /ralphstop   (or run:  ralph stop \"$PWD\")"
 
