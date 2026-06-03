@@ -7,7 +7,7 @@
 # preflight doctor, renders the launchd daemon, and surfaces status/logs/metrics.
 #
 # Subcommands (SPEC §8 table, verbatim):
-#   init  start  once  status  tail  pause  resume  stop  doctor  install-daemon
+#   init  start  once  status  watch  tail  pause  resume  stop  doctor  install-daemon
 #   list  logs  metrics  version  help   + hidden __run-supervisor
 #
 # Exit codes (SPEC §8, shared by all surfaces):
@@ -374,12 +374,28 @@ this, each command FOREGROUND and returning immediately (never background-poll):
 1. ralph init "$PWD" 2>/dev/null || true        # scaffold if needed (no-op otherwise)
 2. ralph start "$PWD" --daemon                  # start the never-stopping daemon (idempotent)
 3. ralph status "$PWD"                           # confirm ALIVE + show pid/iteration
+4. ralph watch "$PWD"                            # OPEN a live monitor window (status + per-iteration journal); returns at once
 Then tell the user it is running forever in the BACKGROUND (that is what makes it never-stop +
-stall-proof) and how to FOLLOW IT LIVE from the IDE terminal — `ralph status "$PWD" --watch` (live
-dashboard, refreshes every 2s) or `ralph tail "$PWD"` (streams every iteration) — plus how to stop
-(`ralph stop "$PWD"`). You are DONE — the daemon owns the loop and survives this chat closing; do not
-iterate/poll/summarize here. If status shows NOT alive (sandbox blocked the launch), tell the user to
-run `ralph start "$PWD" --daemon` once in a plain terminal.
+stall-proof), that a LIVE monitor window opened showing WHAT IT DID each iteration (.ralph/PROGRESS.md),
+and how to stop: type /ralphstop (or run `ralph stop "$PWD"`). If the window didn't open, run
+`ralph watch "$PWD"`; raw engine log is `ralph tail "$PWD"`. You are DONE — the daemon owns the loop and
+survives this chat closing; do not iterate/poll/summarize here. If status shows NOT alive (sandbox
+blocked the launch), tell the user to run `ralph start "$PWD" --daemon` once in a plain terminal.
+Hard limits: no financial actions; no broad `rm -rf`; no force-push to main; no DB drop; no push to a
+remote the user doesn't own.
+WF
+  fi
+  if [ ! -f "$target/.agent/workflows/ralphstop.md" ]; then
+    cat > "$target/.agent/workflows/ralphstop.md" <<'WF'
+---
+description: Stop the never-stop Ralph engine on THIS repo. /ralphstop drains the background daemon (ralph stop) — the loop halts within ~20s and stays down until you run /ralphloop again.
+---
+# /ralphstop — stop the never-stop engine
+The user wants to STOP the background Ralph daemon on this repo. Do EXACTLY:
+1. ralph stop "$PWD"            # STOP sentinel + SIGTERM → drains within ~20s
+2. ralph status "$PWD"           # confirm it is stopped/dead
+Then tell the user it is stopped and that /ralphloop restarts it. For a stop that also survives reboot
+(no auto-resume): `ralph stop "$PWD" --permanent`. You are DONE — do not iterate/summarize repeatedly.
 Hard limits: no financial actions; no broad `rm -rf`; no force-push to main; no DB drop; no push to a
 remote the user doesn't own.
 WF
@@ -659,6 +675,76 @@ cmd_tail() {
   exec tail -f "$sup"
 }
 
+# ── watch — a LIVE window into the background daemon: status + WHAT IT DID each iteration ──────────
+# The loop runs headless in the daemon; `ralph watch <target>` is the user's live window into it. It
+# pops a new Terminal.app window (so it shows up as its own tab/window) running a refreshing panel of
+# the status PLUS the per-iteration explanations the agent writes to .ralph/PROGRESS.md
+# (Task / Changes / Verification / Decision). Modes:
+#   (default)   open a GUI Terminal window running `ralph watch <target> --here`
+#   --here      inline refreshing panel (status header + tail of PROGRESS.md); Ctrl-C to exit
+#   --journal   exec tail -f PROGRESS.md      (pure stream of the "what I did" blocks as they land)
+#   --log       exec tail -f supervisor.log   (engine log, iteration-by-iteration rc/class)
+cmd_watch() {
+  local mode="gui" target_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here|--inline) mode="here";    shift ;;
+      --journal|--progress) mode="journal"; shift ;;
+      --log|--tail)    mode="log";     shift ;;
+      --*)             die "watch: unknown flag $1" ;;
+      *)               target_arg="$1"; shift ;;
+    esac
+  done
+  local target; target="$(resolve_target "$target_arg")" || exit 1
+  require_initialized "$target"
+  local prog="$target/.ralph/PROGRESS.md" sup="$target/.ralph/logs/supervisor.log"
+  local self="$RALPH_BIN_DIR/ralph"
+
+  case "$mode" in
+    journal)
+      [ -f "$prog" ] || die "watch: no PROGRESS.md yet (started?)"
+      printf '═══ what ralph is doing each iteration — %s (live; Ctrl-C to exit) ═══\n' "$(basename "$target")"
+      exec tail -n 40 -f "$prog"
+      ;;
+    log)
+      [ -f "$sup" ] || die "watch: no supervisor.log yet (started?)"
+      exec tail -n 40 -f "$sup"
+      ;;
+    here)
+      # Inline live panel: status header + the latest per-iteration explanations from PROGRESS.md.
+      while true; do
+        clear 2>/dev/null || true
+        printf '═══ ralph watch — %s ═══   (Ctrl-C to exit)\n' "$(basename "$target")"
+        "$self" status "$target" 2>/dev/null | sed -n '2,9p'
+        printf '\n─── WHAT IT DID (latest iterations · .ralph/PROGRESS.md) ───────────────────\n'
+        if [ -f "$prog" ]; then tail -n 26 "$prog"; else printf '(no PROGRESS.md entries yet — first iteration in flight)\n'; fi
+        /usr/bin/perl -e 'select(undef,undef,undef,4)' 2>/dev/null || sleep 4 2>/dev/null || true
+      done
+      ;;
+    gui)
+      if command -v osascript >/dev/null 2>&1; then
+        local inner esc
+        inner="$self watch \"$target\" --here"
+        esc="$(printf '%s' "$inner" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        if osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  do script "$esc"
+  activate
+end tell
+OSA
+        then
+          printf 'ralph: opened a LIVE monitor window (status + per-iteration journal) for %s.\n' "$(basename "$target")"
+          return 0
+        fi
+      fi
+      # osascript blocked/absent (sandbox or headless): do NOT block the caller (an agy workflow must
+      # never hang here). Just tell the user the one command to run in a terminal themselves.
+      printf 'ralph: could not auto-open a window. Run this in a terminal to watch live:\n  ralph watch %s\n' "$target"
+      return 0
+      ;;
+  esac
+}
+
 # ── pause / resume (SPEC §8) ───────────────────────────────────────────────────
 cmd_pause() {
   local target; target="$(resolve_target "${1:-}")" || exit 1
@@ -909,6 +995,9 @@ COMMANDS
   status [target] [--json] [--watch]
                      alive/dead/paused, iter, phase, class, failures/reverts, ETA, stalled.
                      exit 0=alive, 1=dead, 2=paused.
+  watch [target] [--here|--journal|--log]
+                     Open a LIVE monitor window (status + per-iteration PROGRESS journal). Default pops
+                     a Terminal window; --here runs inline; --journal streams PROGRESS.md; --log the engine log.
   tail [target] [--iter N]   tail -f the supervisor log (or one iteration).
   pause [target]     touch .ralph/PAUSE (idles, keeps heartbeating). exit 2.
   resume [target]    rm .ralph/PAUSE.
@@ -947,6 +1036,7 @@ main() {
     start)           cmd_start "$@" ;;
     once)            cmd_once "$@" ;;
     status)          cmd_status "$@" ;;
+    watch)           cmd_watch "$@" ;;
     tail)            cmd_tail "$@" ;;
     pause)           cmd_pause "$@" ;;
     resume)          cmd_resume "$@" ;;
