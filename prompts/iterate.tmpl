@@ -65,11 +65,16 @@ STEP 2 — SELECT ONE ITEM via the tier ladder (lower number = higher priority):
 STEP 3 — DO THE ONE THING. Smallest change that moves your chosen metric. Focused diff. No
          "while I'm here" refactors. Do NOT edit anything under .ralph/.
 
-STEP 4 — VERIFY. Run: {{VERIFY_CMD}}
-         It must (a) pass and (b) write fresh numbers to .ralph/metrics/latest.json. If it fails or
-         a metric worsens, FIX or REVERT your own change before continuing. Do not hand off red.
-         (The harness independently re-runs verify and re-measures every metric; fabricated numbers
-         are detected and the iteration is auto-reverted.)
+STEP 4 — VERIFY (FAST — do not stall the iteration). Verify your change in the FOREGROUND and read the
+         result directly. NEVER launch a long command as a background task and then poll/"wait for it to
+         finish" — that hangs the run with no output until the watchdog has to kill it.
+         • Prefer a FOCUSED check: run ONLY the tests for the file you changed
+           (e.g. `python3 -m pytest tests/test_<module>.py -q`), NOT the whole suite. That confirms your
+           unit is green — the harness INDEPENDENTLY re-runs the FULL `{{VERIFY_CMD}}` and re-measures every
+           metric (bounded), so you do NOT need to run the entire suite yourself.
+         • Only if a focused run is impossible, run `{{VERIFY_CMD}}` — foreground and bounded.
+         If it fails or a metric worsens, FIX or REVERT your own change before continuing. Do not hand off
+         red. (The harness re-measures every metric; fabricated numbers are detected and auto-reverted.)
 
 STEP 5 — RECORD (your durable memory; future iterations depend on it):
          (a) APPEND exactly ONE block to .ralph/PROGRESS.md (ITER schema, status=PROPOSED). NEVER

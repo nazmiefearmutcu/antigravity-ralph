@@ -77,8 +77,25 @@ bounded_run() {
   #      for the full (possibly 90s) cap.
   (
     rem="$secs"
+    # IDLE watchdog (opt-in via BOUNDED_IDLE_S>0): if the command emits NO output to <log> for that many
+    # seconds it is treated as a STALL and group-killed early (exit 124), exactly like the wall-clock cap.
+    # This reclaims a wedged-but-silent child — e.g. agy frozen "waiting for response" — in minutes
+    # instead of waiting out the full wall, so the loop self-recovers fast. Belt-and-suspenders with the
+    # wall-clock cap below; both group-kill and exit 124 → the supervisor classifies it `timeout` & advances.
+    idle="${BOUNDED_IDLE_S:-0}"; case "$idle" in ''|*[!0-9]*) idle=0 ;; esac
+    last_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"; last_grow="$(date +%s 2>/dev/null || echo 0)"
     while [ "$(awk -v r="$rem" 'BEGIN{print (r>0)?1:0}')" = 1 ]; do
       kill -0 "$cmd_pid" 2>/dev/null || exit 0          # target finished/killed → leave promptly
+      if [ "$idle" -gt 0 ]; then                        # no-output stall detection
+        cur_sz="$(stat -f%z "$log" 2>/dev/null || echo 0)"
+        if [ "$cur_sz" != "$last_sz" ]; then last_sz="$cur_sz"; last_grow="$(date +%s 2>/dev/null || echo 0)"; fi
+        if [ "$(( $(date +%s 2>/dev/null || echo 0) - last_grow ))" -ge "$idle" ]; then
+          kill -TERM -"$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null
+          "$RALPH_PERL" -e 'select(undef,undef,undef,5)'
+          kill -KILL -"$cmd_pid" 2>/dev/null || kill -KILL "$cmd_pid" 2>/dev/null
+          exit 124
+        fi
+      fi
       step="$(awk -v r="$rem" 'BEGIN{print (r<2)?r:2}')" # tick = min(2, remaining)
       "$RALPH_PERL" -e 'select(undef,undef,undef,$ARGV[0])' "$step"
       rem="$(awk -v r="$rem" -v s="$step" 'BEGIN{print r-s}')"

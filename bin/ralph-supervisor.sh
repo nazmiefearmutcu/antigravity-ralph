@@ -135,6 +135,7 @@ load_config() {
   : "${RALPH_MAX_ITERATIONS:=0}"
   : "${RALPH_MIN_INTERVAL_S:=20}"
   : "${RALPH_AGY_TIMEOUT_S:=900}"
+  : "${RALPH_AGY_IDLE_TIMEOUT_S:=420}"   # kill agy early if it emits NO output for this long (stall self-recovery)
   : "${RALPH_BACKOFF_BASE_S:=30}"
   : "${RALPH_BACKOFF_CAP_S:=1800}"
   : "${RALPH_BACKOFF_JITTER_PCT:=25}"
@@ -205,7 +206,7 @@ RALPH_OVR_EOF
   # Referee sandbox flag (gate.sh reads it; the worker also derives its own from RALPH_SANDBOX).
   SANDBOX_FLAG=""; [ "${RALPH_SANDBOX:-1}" = 1 ] && SANDBOX_FLAG="--sandbox"
 
-  export RALPH_TARGET_NAME RALPH_MAX_ITERATIONS RALPH_MIN_INTERVAL_S RALPH_AGY_TIMEOUT_S \
+  export RALPH_TARGET_NAME RALPH_MAX_ITERATIONS RALPH_MIN_INTERVAL_S RALPH_AGY_TIMEOUT_S RALPH_AGY_IDLE_TIMEOUT_S \
          RALPH_BACKOFF_BASE_S RALPH_BACKOFF_CAP_S RALPH_BACKOFF_JITTER_PCT \
          RALPH_CRASHLOOP_THRESHOLD RALPH_CRASHLOOP_WINDOW_S RALPH_CRASHLOOP_COOLDOWN_S \
          RALPH_MAX_CONSECUTIVE_REVERTS RALPH_RELAUNCH_ANTIGRAVITY RALPH_SKIP_PERMISSIONS \
@@ -370,7 +371,9 @@ main() {
     [ "$RALPH_SKIP_PERMISSIONS" = 1 ] && set -- "$@" --dangerously-skip-permissions
     [ "$RALPH_SANDBOX" = 1 ]          && set -- "$@" --sandbox
 
-    bounded_run "$((RALPH_AGY_TIMEOUT_S + 60))" "$ITDIR/agy.stdout" -- "$@"
+    # BOUNDED_IDLE_S: reclaim a SILENT-but-alive agy (frozen "waiting for response") after this many
+    # seconds of no output — far sooner than the wall-clock cap, so a stall self-recovers in minutes.
+    BOUNDED_IDLE_S="$RALPH_AGY_IDLE_TIMEOUT_S" bounded_run "$((RALPH_AGY_TIMEOUT_S + 60))" "$ITDIR/agy.stdout" -- "$@"
     rc=$?
     printf '%s\n' "$rc" > "$ITDIR/agy.exit"
     sha_after="$(git -C "$TARGET" rev-parse --short HEAD 2>/dev/null || echo none)"
