@@ -1,10 +1,11 @@
 ---
-name: ralphloop
-trigger: "/ralphloop" or "/ralph" or "keep improving this repo until I say stop"
-description: Run the Ralph discipline in-IDE — one strictly-better unit per turn, externalize state to files, never pause for a summary.
+description: Never-stop Ralph discipline — keep improving this repo, one strictly-better VERIFIED unit per turn, externalize state to .ralph/ files, never pause to summarize. Use when the user wants the loop to run, or says "keep improving until I stop".
 ---
 # Never-Stop Ralph (in-IDE)
-Until the user types an explicit stop word:
+<!-- Install this file as ~/.gemini/antigravity/global_workflows/ralphloop.md — Antigravity derives the
+     slash command from the FILENAME, so this becomes /ralphloop. Restart Antigravity after adding it
+     so the language_server re-indexes global_workflows. -->
+When invoked (`/ralphloop`), until the user types an explicit stop word:
 1. READ state from disk first: `.ralph/MISSION.md`, `.ralph/HANDOFF.md`, `.ralph/LEDGER.md` (OPEN),
    last 3 `.ralph/PROGRESS.md` blocks, `.ralph/RATCHET.json`. Never trust memory.
 2. Pick ONE unit that makes the next handoff STRICTLY BETTER than HEAD (real bug fix → real coverage
