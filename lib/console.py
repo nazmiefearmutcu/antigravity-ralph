@@ -110,6 +110,7 @@ def read_status():
         os.path.expanduser("~/.gemini/antigravity-cli/settings.json"), "model", "(unknown)")
     q = _read(os.path.join(RALPH, "quota.live"))
     s["quota"] = ""
+    s["quota_pct"] = -1
     m_reset = re.search(r"RESET_EPOCH=(\d+)", q)
     m_cred = re.search(r"CREDITS=(\d+)", q)
     if m_reset:
@@ -121,7 +122,22 @@ def read_status():
         rin = reset_e - now
         clk = time.strftime("%H:%M", time.localtime(reset_e))
         cred = (" · %s credits" % m_cred.group(1)) if m_cred else ""
-        s["quota"] = "quota refreshes %s (in %dh%02dm)%s" % (clk, rin // 3600, (rin % 3600) // 60, cred)
+        s["quota"] = "refreshes %s (in %dh%02dm)%s" % (clk, rin // 3600, (rin % 3600) // 60, cred)
+        s["quota_pct"] = max(0, min(100, int(rin * 100 / win)))  # % of the refresh window remaining
+    # latest completed iteration (for conversational "replies" in the chat)
+    s["prog_iter"] = None
+    s["prog_summary"] = ""
+    prog = _read(os.path.join(RALPH, "PROGRESS.md"))
+    mi = re.findall(r"## ITER (\d+)", prog)
+    if mi:
+        s["prog_iter"] = mi[-1]
+        last = re.split(r"## ITER ", prog)[-1]
+        tm = re.search(r"\*\*Task\*\*:\s*(.+)", last)
+        vm = re.search(r"VERDICT \d+ (ACCEPTED|REJECTED)[^\n]*", last)
+        dm = re.search(r"\*\*Decision\*\*:\s*(.+)", last)
+        task = tm.group(1).strip()[:70] if tm else ""
+        verdict = vm.group(0).strip()[:64] if vm else (dm.group(1).strip()[:40] if dm else "")
+        s["prog_summary"] = (task + ((" → " + verdict) if verdict else "")).strip()[:118]
     # last consumed iter (for chat "delivered" feedback)
     arch = _read(os.path.join(RALPH, "INBOX.archive"))
     mc = re.findall(r"consumed @ iter (\d+)", arch)
@@ -173,22 +189,29 @@ def main(stdscr):
     last_refresh = 0.0
     last_qprobe = 0.0
     base_consumed = status.get("last_consumed")
+    last_shown_iter = status.get("prog_iter")   # don't replay history; only show iterations from now on
 
-    chat.append(("sys", "Connected to the loop on %s. Type a directive and press Enter — it steers the" % NAME))
-    chat.append(("sys", "loop on its next iteration without ever stopping it. Ctrl-C to close (loop keeps running)."))
+    chat.append(("sys", "Connected to the loop on %s. Just type a directive + Enter — it steers the loop" % NAME))
+    chat.append(("sys", "on its next iteration (never stops). The loop's completed iterations show up here as replies."))
 
     while True:
         now = time.time()
         if now - last_refresh > 1.0:
             status = read_status()
             last_refresh = now
-            # delivery feedback: if a new "consumed @ iter N" appeared and we had pending msgs
+            # delivery feedback: a new "consumed @ iter N" appeared and we had pending msgs
             lc = status.get("last_consumed")
             if pending_msgs and lc and lc != base_consumed:
                 for _ in pending_msgs:
                     chat.append(("ralph", "✓ delivered to iteration %s — acting on it now" % lc))
                 pending_msgs = []
                 base_consumed = lc
+            # conversational reply: the loop finished an iteration → show what it did
+            pi = status.get("prog_iter")
+            if pi and pi != last_shown_iter:
+                last_shown_iter = pi
+                summ = status.get("prog_summary") or "(done)"
+                chat.append(("ralph", "iter %s ✓  %s" % (pi, summ)))
         if now - last_qprobe > 60:
             refresh_quota_bg()
             last_qprobe = now
@@ -232,6 +255,15 @@ def _addstr(stdscr, y, x, s, attr=0):
             pass
 
 
+def _bar(pct, w=16):
+    try:
+        pct = max(0, min(100, int(pct)))
+    except Exception:
+        pct = 0
+    f = pct * w // 100
+    return "█" * f + "░" * (w - f)
+
+
 def _rule(stdscr, y, label=""):
     """A full-width horizontal divider line, optionally with an embedded label."""
     h, w = stdscr.getmaxyx()
@@ -264,9 +296,13 @@ def draw(stdscr, s, chat, inp):
         plabel = "⚠ STALLED?"
     _addstr(stdscr, 1, 0, "  %s" % plabel, CY)
     _addstr(stdscr, 2, 0, "  model : %s" % s.get("model", "?"), 0)
-    # quota on its OWN line so it is always visible (refresh time + AI credits, live from the app)
-    qline = s.get("quota") or "(open the app's Models panel for live quota)"
-    _addstr(stdscr, 3, 0, "  quota : %s" % qline, MA | BOLD)
+    # quota on its OWN line with a refresh-CYCLE bar (time left until the quota window refreshes — this is
+    # exact; the app's per-model remaining-% isn't exposed outside its UI). Live refresh time + AI credits.
+    qpct = s.get("quota_pct", -1)
+    if qpct >= 0:
+        _addstr(stdscr, 3, 0, "  quota : %s  %s" % (_bar(qpct, 16), s.get("quota", "")), MA | BOLD)
+    else:
+        _addstr(stdscr, 3, 0, "  quota : (open the app's Settings ▸ Models panel for live quota)", MA)
     _addstr(stdscr, 4, 0, "  ▸ doing: %s" % (s.get("doing") or "(thinking…)"), GR)
     _addstr(stdscr, 5, 0, "  ▸ last : %s" % (s.get("last_change") or "(none yet)"), 0)
 
@@ -278,19 +314,22 @@ def draw(stdscr, s, chat, inp):
     div_y = 6
     _rule(stdscr, div_y, label)
 
-    # chat log: from div_y+1 down to the divider above the input (h-2)
+    # chat log — BOTTOM-anchored (newest messages sit right above the input, like a real chat, so a reply
+    # is never stranded at the top of a tall window).
     top = div_y + 1
-    rows = h - 2 - top
+    rows = max(0, h - 2 - top)
     lines = []
     for who, text in chat:
         if who == "you":
             lines.append(("you ▸ " + text, CY | BOLD))
         elif who == "ralph":
-            lines.append(("      " + text, GR))
+            lines.append(("ralph ▸ " + text, GR))
         else:
             lines.append(("      " + text, curses.A_DIM))
-    for i, (text, attr) in enumerate(lines[-rows:] if rows > 0 else []):
-        _addstr(stdscr, top + i, 1, text, attr)
+    visible = lines[-rows:] if rows > 0 else []
+    y0 = max(top, (h - 2) - len(visible))
+    for i, (text, attr) in enumerate(visible):
+        _addstr(stdscr, y0 + i, 1, text, attr)
 
     # ── divider directly above the input box, then the input line ──
     _rule(stdscr, h - 2)
