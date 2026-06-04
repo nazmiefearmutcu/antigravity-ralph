@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -140,9 +141,14 @@ def queue_message(msg):
 
 
 def refresh_quota_bg():
+    # Probe the IDE for live quota in the background; write atomically (rename only AFTER it completes,
+    # ~1-2s) so read_status never sees a half-written file. Reads quota.live each tick.
+    live = os.path.join(RALPH, "quota.live")
+    cmd = "%s quota %s > %s.new 2>/dev/null && mv -f %s.new %s" % (
+        shlex.quote(RALPH_BIN), shlex.quote(TARGET),
+        shlex.quote(live), shlex.quote(live), shlex.quote(live))
     try:
-        with open(os.path.join(RALPH, "quota.live.tmp"), "w") as out:
-            subprocess.Popen([RALPH_BIN, "quota", TARGET], stdout=out, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["/bin/sh", "-c", cmd])
     except Exception:
         pass
 
@@ -185,12 +191,6 @@ def main(stdscr):
                 base_consumed = lc
         if now - last_qprobe > 60:
             refresh_quota_bg()
-            try:
-                tmp = os.path.join(RALPH, "quota.live.tmp")
-                if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                    os.replace(tmp, os.path.join(RALPH, "quota.live"))
-            except Exception:
-                pass
             last_qprobe = now
 
         draw(stdscr, status, chat, inp)
@@ -232,6 +232,17 @@ def _addstr(stdscr, y, x, s, attr=0):
             pass
 
 
+def _rule(stdscr, y, label=""):
+    """A full-width horizontal divider line, optionally with an embedded label."""
+    h, w = stdscr.getmaxyx()
+    if label:
+        lab = " " + label + " "
+        line = "──" + lab + ("─" * max(0, w - len(lab) - 3))
+    else:
+        line = "─" * max(0, w - 1)
+    _addstr(stdscr, y, 0, line[:max(0, w - 1)], curses.color_pair(3))
+
+
 def draw(stdscr, s, chat, inp):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -252,19 +263,22 @@ def draw(stdscr, s, chat, inp):
     if s.get("stalled") == "true":
         plabel = "⚠ STALLED?"
     _addstr(stdscr, 1, 0, "  %s" % plabel, CY)
-    if s.get("quota"):
-        _addstr(stdscr, 1, max(34, w - len(s["quota"]) - 3), s["quota"], MA)
-    _addstr(stdscr, 2, 0, "  model: %s" % s.get("model", "?"), 0)
-    _addstr(stdscr, 3, 0, "  ▸ doing: %s" % (s.get("doing") or "(thinking…)"), GR)
-    _addstr(stdscr, 4, 0, "  ▸ last : %s" % (s.get("last_change") or "(none yet)"), 0)
+    _addstr(stdscr, 2, 0, "  model : %s" % s.get("model", "?"), 0)
+    # quota on its OWN line so it is always visible (refresh time + AI credits, live from the app)
+    qline = s.get("quota") or "(open the app's Models panel for live quota)"
+    _addstr(stdscr, 3, 0, "  quota : %s" % qline, MA | BOLD)
+    _addstr(stdscr, 4, 0, "  ▸ doing: %s" % (s.get("doing") or "(thinking…)"), GR)
+    _addstr(stdscr, 5, 0, "  ▸ last : %s" % (s.get("last_change") or "(none yet)"), 0)
 
-    div_y = 5
+    # ── clear full-width divider that opens the CHAT region ──
     pend = s.get("inbox_pending", 0)
-    pend_s = ("  📨 %d queued" % pend) if pend else ""
-    divider = "─ chat — type a directive + Enter to steer the loop (never stops) " + ("─" * w)
-    _addstr(stdscr, div_y, 0, (divider[:max(0, w - len(pend_s) - 1)] + pend_s), YE)
+    label = "CHAT — just type a directive + Enter to steer the loop (it never stops)"
+    if pend:
+        label += "  ·  📨 %d queued" % pend
+    div_y = 6
+    _rule(stdscr, div_y, label)
 
-    # chat log fills from div_y+1 to h-2
+    # chat log: from div_y+1 down to the divider above the input (h-2)
     top = div_y + 1
     rows = h - 2 - top
     lines = []
@@ -278,7 +292,8 @@ def draw(stdscr, s, chat, inp):
     for i, (text, attr) in enumerate(lines[-rows:] if rows > 0 else []):
         _addstr(stdscr, top + i, 1, text, attr)
 
-    # input line at the bottom
+    # ── divider directly above the input box, then the input line ──
+    _rule(stdscr, h - 2)
     _addstr(stdscr, h - 1, 0, "> " + inp, BOLD)
     try:
         stdscr.move(h - 1, min(w - 1, 2 + len(inp)))
